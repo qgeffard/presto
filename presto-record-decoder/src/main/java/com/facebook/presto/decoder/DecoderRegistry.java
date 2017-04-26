@@ -57,11 +57,7 @@ public class DecoderRegistry
         Map<String, ImmutableSetMultimap.Builder<Class<?>, FieldDecoder<?>>> fieldDecoderBuilders = new HashMap<>();
 
         for (FieldDecoder<?> fieldDecoder : fieldDecoders) {
-            ImmutableSetMultimap.Builder<Class<?>, FieldDecoder<?>> fieldDecoderBuilder = fieldDecoderBuilders.get(fieldDecoder.getRowDecoderName());
-            if (fieldDecoderBuilder == null) {
-                fieldDecoderBuilder = ImmutableSetMultimap.builder();
-                fieldDecoderBuilders.put(fieldDecoder.getRowDecoderName(), fieldDecoderBuilder);
-            }
+            ImmutableSetMultimap.Builder<Class<?>, FieldDecoder<?>> fieldDecoderBuilder = fieldDecoderBuilders.computeIfAbsent(fieldDecoder.getRowDecoderName(), k -> ImmutableSetMultimap.builder());
 
             for (Class<?> clazz : fieldDecoder.getJavaTypes()) {
                 fieldDecoderBuilder.put(clazz, fieldDecoder);
