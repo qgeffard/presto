@@ -215,29 +215,26 @@ public class KafkaMetadata
         ImmutableList.Builder<ColumnMetadata> builder = ImmutableList.builder();
 
         KafkaTopicFieldGroup key = table.getKey();
-        if (key != null) {
-            List<KafkaTopicFieldDescription> fields = key.getFields();
-            if (fields != null) {
-                for (KafkaTopicFieldDescription fieldDescription : fields) {
-                    builder.add(fieldDescription.getColumnMetadata());
-                }
-            }
-        }
+        addFieldDescriptionsToBuilder(builder, key);
 
         KafkaTopicFieldGroup message = table.getMessage();
-        if (message != null) {
-            List<KafkaTopicFieldDescription> fields = message.getFields();
-            if (fields != null) {
-                for (KafkaTopicFieldDescription fieldDescription : fields) {
-                    builder.add(fieldDescription.getColumnMetadata());
-                }
-            }
-        }
+        addFieldDescriptionsToBuilder(builder, message);
 
         for (KafkaInternalFieldDescription fieldDescription : internalFieldDescriptions) {
             builder.add(fieldDescription.getColumnMetadata(hideInternalColumns));
         }
 
         return new ConnectorTableMetadata(schemaTableName, builder.build());
+    }
+
+    private void addFieldDescriptionsToBuilder(ImmutableList.Builder<ColumnMetadata> builder, KafkaTopicFieldGroup fieldGroup) {
+        if (fieldGroup != null) {
+            List<KafkaTopicFieldDescription> fields = fieldGroup.getFields();
+            if (fields != null) {
+                for (KafkaTopicFieldDescription fieldDescription : fields) {
+                    builder.add(fieldDescription.getColumnMetadata());
+                }
+            }
+        }
     }
 }

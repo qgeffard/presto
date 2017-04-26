@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.decoder;
 
+import com.facebook.presto.decoder.avro.AvroDecoderModule;
 import com.facebook.presto.decoder.csv.CsvDecoderModule;
 import com.facebook.presto.decoder.dummy.DummyDecoderModule;
 import com.facebook.presto.decoder.json.JsonDecoderModule;
@@ -35,6 +36,7 @@ public class DecoderModule
         binder.bind(DecoderRegistry.class).in(Scopes.SINGLETON);
 
         binder.install(new DummyDecoderModule());
+        binder.install(new AvroDecoderModule());
         binder.install(new CsvDecoderModule());
         binder.install(new JsonDecoderModule());
         binder.install(new RawDecoderModule());
