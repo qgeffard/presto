@@ -4,6 +4,7 @@ import com.facebook.presto.decoder.DecoderColumnHandle;
 import com.facebook.presto.decoder.FieldDecoder;
 import com.facebook.presto.decoder.FieldValueProvider;
 import com.facebook.presto.decoder.RowDecoder;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.configuration.Config;
@@ -58,7 +59,19 @@ public class AvroRowDecoder implements RowDecoder {
         if(!GenericData.Record.class.isInstance(obj))
             throw new RuntimeException("Fail to deserialize");
 
-        GenericData.Record record = (GenericData.Record)obj;
+        GenericData.Record record = (GenericData.Record) obj;
+
+
+        for (DecoderColumnHandle columnHandle: columnHandles) {
+
+            if (columnHandle.isInternal()) {
+                continue;
+            }
+
+            AvroFieldDecoder decoder = (AvroFieldDecoder) fieldDecoders.get(columnHandle);
+
+            fieldValueProviders.add(decoder.decode(record.get(columnHandle.getName()), columnHandle));
+        }
 
         return false;
     }
