@@ -69,17 +69,29 @@ public class TestAvroDecoder {
                 .nullableBoolean("isBar", false)
                 .name("toto").type().nullable().stringType().noDefault()
                 .nullableInt("titiInt", 10)
+                .name("user").type().nullable().record("user")
+                    .fields()
+                        .nullableString("name", "defaultName")
+                        .nullableInt("age", 0)
+                    .endRecord()
+                    .noDefault()
                 .endRecord();
 
-        GenericData.Record sample = new GenericRecordBuilder(schema).set("isBar", true).set("toto", "toto").set("titiInt", 1234567).build();
+        Integer indexNamed = schema.getField("user").schema().getIndexNamed("user");
+        GenericRecordBuilder user = new GenericRecordBuilder(schema.getField("user").schema().getTypes().get(indexNamed));
+        user.set("name","Harry");
+        user.set("age", 15);
+
+        GenericData.Record sample = new GenericRecordBuilder(schema).set("isBar", true).set("toto", "toto").set("titiInt", 1234567).set("user", user.build() ).build();
 
         dataMap.put("SCHEMA", schema.toString(false));
 
-        DecoderTestColumnHandle row1 = new DecoderTestColumnHandle("", 0, "row1", BooleanType.BOOLEAN, "0", null, null, false, false, false);
-        DecoderTestColumnHandle row2 = new DecoderTestColumnHandle("", 1, "row2", createVarcharType(5), "1", null, null, false, false, false);
-        DecoderTestColumnHandle row3 = new DecoderTestColumnHandle("", 2, "row3", IntegerType.INTEGER, "2", null, null, false, false, false);
+        DecoderTestColumnHandle row1 = new DecoderTestColumnHandle("", 0, "isBar", BooleanType.BOOLEAN, "", null, null, false, false, false);
+        DecoderTestColumnHandle row2 = new DecoderTestColumnHandle("", 1, "toto", createVarcharType(5), "", null, null, false, false, false);
+        DecoderTestColumnHandle row3 = new DecoderTestColumnHandle("", 2, "titiInt", IntegerType.INTEGER, "", null, null, false, false, false);
+        DecoderTestColumnHandle row4 = new DecoderTestColumnHandle("", 3, "user", createVarcharType(Integer.MAX_VALUE - 1), "", null, null, false, false, false);
 
-        List<DecoderColumnHandle> columns = ImmutableList.of(row1, row2, row3);
+        List<DecoderColumnHandle> columns = ImmutableList.of(row1, row2, row3, row4);
         Set<FieldValueProvider> providers = new HashSet<>();
 
         boolean corrupt = avroDecoder.decodeRow(avroSerializer.serialize(topic, sample), dataMap, providers, columns, buildMap(columns));
@@ -90,6 +102,7 @@ public class TestAvroDecoder {
         checkValue(providers, row1, true);
         checkValue(providers, row2, "toto");
         checkValue(providers, row3, 1234567);
+        checkValue(providers, row4, "{\"name\": \"Harry\", \"age\": 15}");
     }
 
     @Test
