@@ -13,9 +13,8 @@
  */
 package com.facebook.presto.operator.scalar;
 
-import com.facebook.presto.type.ArrayType;
-import com.facebook.presto.type.MapType;
-import com.facebook.presto.type.RowType;
+import com.facebook.presto.spi.type.ArrayType;
+import com.facebook.presto.spi.type.RowType;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.testng.annotations.Test;
@@ -28,14 +27,20 @@ import static com.facebook.presto.spi.type.IntegerType.INTEGER;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
 import static com.facebook.presto.spi.type.VarcharType.createVarcharType;
 import static com.facebook.presto.type.UnknownType.UNKNOWN;
+import static com.facebook.presto.util.StructuralTestUtil.mapType;
 import static java.util.Arrays.asList;
 
 public class TestZipWithFunction
         extends AbstractTestFunctions
 {
     @Test
+    public void testRetainedSizeBounded()
+    {
+        assertCachedInstanceHasBoundedRetainedSize("zip_with(ARRAY [25, 26, 27], ARRAY [1, 2, 3], (x, y) -> x + y)");
+    }
+
+    @Test
     public void testSameLength()
-            throws Exception
     {
         assertFunction("zip_with(ARRAY[], ARRAY[], (x, y) -> (y, x))",
                 new ArrayType(new RowType(ImmutableList.of(UNKNOWN, UNKNOWN), Optional.empty())),
@@ -66,13 +71,12 @@ public class TestZipWithFunction
                 ImmutableList.of("ac", "bd"));
 
         assertFunction("zip_with(ARRAY[MAP(ARRAY[CAST ('a' AS VARCHAR)], ARRAY[1]), MAP(ARRAY[CAST('b' AS VARCHAR)], ARRAY[2])], ARRAY[MAP(ARRAY['c'], ARRAY[3]), MAP()], (x, y) -> map_concat(x, y))",
-                new ArrayType(new MapType(VARCHAR, INTEGER)),
+                new ArrayType(mapType(VARCHAR, INTEGER)),
                 ImmutableList.of(ImmutableMap.of("a", 1, "c", 3), ImmutableMap.of("b", 2)));
     }
 
     @Test
     public void testDifferentLength()
-            throws Exception
     {
         assertInvalidFunction("zip_with(ARRAY[1], ARRAY['a', 'b'], (x, y) -> (y, x))", "Arrays must have the same length");
         assertInvalidFunction("zip_with(ARRAY[NULL, 2], ARRAY['a'], (x, y) -> (y, x))", "Arrays must have the same length");
@@ -81,7 +85,6 @@ public class TestZipWithFunction
 
     @Test
     public void testWithNull()
-            throws Exception
     {
         assertFunction("zip_with(CAST(NULL AS ARRAY(UNKNOWN)), ARRAY[], (x, y) -> (y, x))",
                 new ArrayType(new RowType(ImmutableList.of(UNKNOWN, UNKNOWN), Optional.empty())),

@@ -33,7 +33,6 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
 import com.google.common.io.Files;
 import io.airlift.slice.Slice;
-import io.airlift.testing.FileUtils;
 import io.airlift.testing.TestingTicker;
 import io.airlift.units.Duration;
 import org.skife.jdbi.v2.DBI;
@@ -45,6 +44,7 @@ import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -83,6 +83,8 @@ import static com.google.common.base.Ticker.systemTicker;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.collect.Iterators.concat;
 import static com.google.common.collect.Iterators.transform;
+import static com.google.common.io.MoreFiles.deleteRecursively;
+import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
 import static io.airlift.slice.Slices.utf8Slice;
 import static java.lang.String.format;
 import static java.time.ZoneOffset.UTC;
@@ -112,14 +114,14 @@ public class TestDatabaseShardManager
 
     @AfterMethod
     public void teardown()
+            throws IOException
     {
         dummyHandle.close();
-        FileUtils.deleteRecursively(dataDir);
+        deleteRecursively(dataDir.toPath(), ALLOW_INSECURE);
     }
 
     @Test
     public void testCommit()
-            throws Exception
     {
         long tableId = createTable("test");
 
@@ -213,8 +215,8 @@ public class TestDatabaseShardManager
         UUID shard1 = UUID.randomUUID();
         UUID shard2 = UUID.randomUUID();
         List<ShardInfo> shardNodes = ImmutableList.of(
-                new ShardInfo(shard1, bucketNumber, ImmutableSet.of("node1"), ImmutableList.of(), 3, 33, 333),
-                new ShardInfo(shard2, bucketNumber, ImmutableSet.of("node1"), ImmutableList.of(), 5, 55, 555));
+                new ShardInfo(shard1, bucketNumber, ImmutableSet.of("node1"), ImmutableList.of(), 3, 33, 333, 0),
+                new ShardInfo(shard2, bucketNumber, ImmutableSet.of("node1"), ImmutableList.of(), 5, 55, 555, 0));
         List<ColumnInfo> columns = ImmutableList.of(new ColumnInfo(1, BIGINT));
 
         shardManager.createTable(tableId, columns, false, OptionalLong.empty());
@@ -239,7 +241,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testGetNodeTableShards()
-            throws Exception
     {
         long tableId = createTable("test");
         List<ColumnInfo> columns = ImmutableList.of(new ColumnInfo(1, BIGINT));
@@ -268,7 +269,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testGetExistingShards()
-            throws Exception
     {
         long tableId = createTable("test");
         UUID shard1 = UUID.randomUUID();
@@ -287,7 +287,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testReplaceShardUuids()
-            throws Exception
     {
         long tableId = createTable("test");
         List<ColumnInfo> columns = ImmutableList.of(new ColumnInfo(1, BIGINT));
@@ -349,7 +348,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testExternalBatches()
-            throws Exception
     {
         long tableId = createTable("test");
         Optional<String> externalBatchId = Optional.of("foo");
@@ -438,7 +436,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testTemporalColumnTableCreation()
-            throws Exception
     {
         long tableId = createTable("test");
         List<ColumnInfo> columns = ImmutableList.of(new ColumnInfo(1, TIMESTAMP));
@@ -451,7 +448,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testShardPruning()
-            throws Exception
     {
         ShardInfo shard1 = shardInfo(
                 UUID.randomUUID(),
@@ -582,7 +578,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testShardPruningTruncatedValues()
-            throws Exception
     {
         String prefix = repeat("x", MAX_BINARY_INDEX_SIZE);
 
@@ -622,7 +617,6 @@ public class TestDatabaseShardManager
 
     @Test
     public void testShardPruningNoStats()
-            throws Exception
     {
         ShardInfo shard = shardInfo(UUID.randomUUID(), "node");
         List<ShardInfo> shards = ImmutableList.of(shard);
@@ -710,7 +704,7 @@ public class TestDatabaseShardManager
 
     public static ShardInfo shardInfo(UUID shardUuid, String nodeId, List<ColumnStats> columnStats)
     {
-        return new ShardInfo(shardUuid, OptionalInt.empty(), ImmutableSet.of(nodeId), columnStats, 0, 0, 0);
+        return new ShardInfo(shardUuid, OptionalInt.empty(), ImmutableSet.of(nodeId), columnStats, 0, 0, 0, 0);
     }
 
     private static Set<ShardNodes> toShardNodes(List<ShardInfo> shards)

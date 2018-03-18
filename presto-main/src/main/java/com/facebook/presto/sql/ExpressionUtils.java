@@ -13,9 +13,9 @@
  */
 package com.facebook.presto.sql;
 
-import com.facebook.presto.sql.planner.DependencyExtractor;
 import com.facebook.presto.sql.planner.DeterminismEvaluator;
 import com.facebook.presto.sql.planner.Symbol;
+import com.facebook.presto.sql.planner.SymbolsExtractor;
 import com.facebook.presto.sql.tree.ComparisonExpression;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.ExpressionRewriter;
@@ -43,6 +43,7 @@ import java.util.function.Predicate;
 import static com.facebook.presto.sql.tree.BooleanLiteral.FALSE_LITERAL;
 import static com.facebook.presto.sql.tree.BooleanLiteral.TRUE_LITERAL;
 import static com.facebook.presto.sql.tree.ComparisonExpressionType.IS_DISTINCT_FROM;
+import static com.google.common.base.Predicates.not;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.toList;
@@ -226,21 +227,30 @@ public final class ExpressionUtils
         return disjuncts.isEmpty() ? emptyDefault : or(disjuncts);
     }
 
-    public static Expression stripNonDeterministicConjuncts(Expression expression)
+    public static Expression filterDeterministicConjuncts(Expression expression)
+    {
+        return filterConjuncts(expression, DeterminismEvaluator::isDeterministic);
+    }
+
+    public static Expression filterNonDeterministicConjuncts(Expression expression)
+    {
+        return filterConjuncts(expression, not(DeterminismEvaluator::isDeterministic));
+    }
+
+    public static Expression filterConjuncts(Expression expression, Predicate<Expression> predicate)
     {
         List<Expression> conjuncts = extractConjuncts(expression).stream()
-                .filter(DeterminismEvaluator::isDeterministic)
+                .filter(predicate)
                 .collect(toList());
 
         return combineConjuncts(conjuncts);
     }
 
-    public static Expression stripDeterministicConjuncts(Expression expression)
+    public static boolean referencesAny(Expression expression, Collection<Symbol> variables)
     {
-        return combineConjuncts(extractConjuncts(expression)
-                .stream()
-                .filter((conjunct) -> !DeterminismEvaluator.isDeterministic(conjunct))
-                .collect(toImmutableList()));
+        Set<Symbol> references = SymbolsExtractor.extractUnique(expression);
+
+        return variables.stream().anyMatch(references::contains);
     }
 
     public static Function<Expression, Expression> expressionOrNullSymbols(final Predicate<Symbol>... nullSymbolScopes)
@@ -250,7 +260,7 @@ public final class ExpressionUtils
             resultDisjunct.add(expression);
 
             for (Predicate<Symbol> nullSymbolScope : nullSymbolScopes) {
-                List<Symbol> symbols = DependencyExtractor.extractUnique(expression).stream()
+                List<Symbol> symbols = SymbolsExtractor.extractUnique(expression).stream()
                         .filter(nullSymbolScope)
                         .collect(toImmutableList());
 
@@ -309,11 +319,12 @@ public final class ExpressionUtils
 
     public static Expression rewriteIdentifiersToSymbolReferences(Expression expression)
     {
-        return ExpressionTreeRewriter.rewriteWith(new ExpressionRewriter<Void>() {
+        return ExpressionTreeRewriter.rewriteWith(new ExpressionRewriter<Void>()
+        {
             @Override
             public Expression rewriteIdentifier(Identifier node, Void context, ExpressionTreeRewriter<Void> treeRewriter)
             {
-                return new SymbolReference(node.getName());
+                return new SymbolReference(node.getValue());
             }
 
             @Override

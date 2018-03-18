@@ -14,6 +14,10 @@
 package com.facebook.presto.tests;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.cost.CostCalculator;
+import com.facebook.presto.cost.CostCalculatorUsingExchanges;
+import com.facebook.presto.cost.CostCalculatorWithEstimatedExchanges;
+import com.facebook.presto.cost.CostComparator;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.security.AccessDeniedException;
 import com.facebook.presto.spi.type.Type;
@@ -28,6 +32,7 @@ import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilege;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import io.airlift.units.Duration;
 import org.intellij.lang.annotations.Language;
 import org.testng.SkipException;
 import org.testng.annotations.AfterClass;
@@ -39,9 +44,11 @@ import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
 
+import static com.facebook.presto.sql.ParsingUtil.createParsingOptions;
 import static com.facebook.presto.sql.SqlFormatter.formatSql;
 import static com.facebook.presto.transaction.TransactionBuilder.transaction;
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.base.Strings.nullToEmpty;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.testing.Closeables.closeAllRuntimeException;
 import static java.lang.String.format;
@@ -99,7 +106,12 @@ public abstract class AbstractTestQueryFramework
 
     protected MaterializedResult computeActual(Session session, @Language("SQL") String sql)
     {
-        return queryRunner.execute(session, sql).toJdbcTypes();
+        return queryRunner.execute(session, sql).toTestTypes();
+    }
+
+    protected Object computeScalar(@Language("SQL") String sql)
+    {
+        return computeActual(sql).getOnlyValue();
     }
 
     protected void assertQuery(@Language("SQL") String sql)
@@ -112,11 +124,6 @@ public abstract class AbstractTestQueryFramework
         QueryAssertions.assertQuery(queryRunner, session, sql, h2QueryRunner, sql, false, false);
     }
 
-    public void assertQueryOrdered(@Language("SQL") String sql)
-    {
-        QueryAssertions.assertQuery(queryRunner, getSession(), sql, h2QueryRunner, sql, true, false);
-    }
-
     protected void assertQuery(@Language("SQL") String actual, @Language("SQL") String expected)
     {
         QueryAssertions.assertQuery(queryRunner, getSession(), actual, h2QueryRunner, expected, false, false);
@@ -125,6 +132,16 @@ public abstract class AbstractTestQueryFramework
     protected void assertQuery(Session session, @Language("SQL") String actual, @Language("SQL") String expected)
     {
         QueryAssertions.assertQuery(queryRunner, session, actual, h2QueryRunner, expected, false, false);
+    }
+
+    public void assertQueryOrdered(@Language("SQL") String sql)
+    {
+        assertQueryOrdered(getSession(), sql);
+    }
+
+    public void assertQueryOrdered(Session session, @Language("SQL") String sql)
+    {
+        assertQueryOrdered(session, sql, sql);
     }
 
     protected void assertQueryOrdered(@Language("SQL") String actual, @Language("SQL") String expected)
@@ -167,20 +184,24 @@ public abstract class AbstractTestQueryFramework
         QueryAssertions.assertUpdate(queryRunner, session, sql, OptionalLong.of(count));
     }
 
+    protected void assertQueryFailsEventually(@Language("SQL") String sql, @Language("RegExp") String expectedMessageRegExp, Duration timeout)
+    {
+        QueryAssertions.assertQueryFailsEventually(queryRunner, getSession(), sql, expectedMessageRegExp, timeout);
+    }
+
     protected void assertQueryFails(@Language("SQL") String sql, @Language("RegExp") String expectedMessageRegExp)
     {
-        assertQueryFails(getSession(), sql, expectedMessageRegExp);
+        QueryAssertions.assertQueryFails(queryRunner, getSession(), sql, expectedMessageRegExp);
     }
 
     protected void assertQueryFails(Session session, @Language("SQL") String sql, @Language("RegExp") String expectedMessageRegExp)
     {
-        try {
-            queryRunner.execute(session, sql);
-            fail(format("Expected query to fail: %s", sql));
-        }
-        catch (RuntimeException ex) {
-            assertExceptionMessage(sql, ex, expectedMessageRegExp);
-        }
+        QueryAssertions.assertQueryFails(queryRunner, session, sql, expectedMessageRegExp);
+    }
+
+    protected void assertQueryReturnsEmptyResult(@Language("SQL") String sql)
+    {
+        QueryAssertions.assertQueryReturnsEmptyResult(queryRunner, getSession(), sql);
     }
 
     protected void assertAccessAllowed(@Language("SQL") String sql, TestingPrivilege... deniedPrivileges)
@@ -239,7 +260,7 @@ public abstract class AbstractTestQueryFramework
 
     private static void assertExceptionMessage(String sql, Exception exception, @Language("RegExp") String regex)
     {
-        if (!exception.getMessage().matches(regex)) {
+        if (!nullToEmpty(exception.getMessage()).matches(regex)) {
             fail(format("Expected exception message '%s' to match '%s' for query: %s", exception.getMessage(), regex, sql), exception);
         }
     }
@@ -262,7 +283,7 @@ public abstract class AbstractTestQueryFramework
 
     protected String formatSqlText(String sql)
     {
-        return formatSql(sqlParser.createStatement(sql), Optional.empty());
+        return formatSql(sqlParser.createStatement(sql, createParsingOptions(queryRunner.getDefaultSession())), Optional.empty());
     }
 
     public String getExplainPlan(String query, ExplainType.Type planType)
@@ -271,7 +292,7 @@ public abstract class AbstractTestQueryFramework
         return transaction(queryRunner.getTransactionManager(), queryRunner.getAccessControl())
                 .singleStatement()
                 .execute(queryRunner.getDefaultSession(), session -> {
-                    return explainer.getPlan(session, sqlParser.createStatement(query), planType, emptyList());
+                    return explainer.getPlan(session, sqlParser.createStatement(query, createParsingOptions(session)), planType, emptyList());
                 });
     }
 
@@ -281,7 +302,7 @@ public abstract class AbstractTestQueryFramework
         return transaction(queryRunner.getTransactionManager(), queryRunner.getAccessControl())
                 .singleStatement()
                 .execute(queryRunner.getDefaultSession(), session -> {
-                    return explainer.getGraphvizPlan(session, sqlParser.createStatement(query), planType, emptyList());
+                    return explainer.getGraphvizPlan(session, sqlParser.createStatement(query, createParsingOptions(session)), planType, emptyList());
                 });
     }
 
@@ -290,12 +311,25 @@ public abstract class AbstractTestQueryFramework
         Metadata metadata = queryRunner.getMetadata();
         FeaturesConfig featuresConfig = new FeaturesConfig().setOptimizeHashGeneration(true);
         boolean forceSingleNode = queryRunner.getNodeCount() == 1;
-        List<PlanOptimizer> optimizers = new PlanOptimizers(metadata, sqlParser, featuresConfig, forceSingleNode, new MBeanExporter(new TestingMBeanServer())).get();
+        CostCalculator costCalculator = new CostCalculatorUsingExchanges(queryRunner::getNodeCount);
+        List<PlanOptimizer> optimizers = new PlanOptimizers(
+                metadata,
+                sqlParser,
+                featuresConfig,
+                forceSingleNode,
+                new MBeanExporter(new TestingMBeanServer()),
+                queryRunner.getStatsCalculator(),
+                costCalculator,
+                new CostCalculatorWithEstimatedExchanges(costCalculator, queryRunner::getNodeCount),
+                new CostComparator(featuresConfig)).get();
         return new QueryExplainer(
                 optimizers,
                 metadata,
+                queryRunner.getNodePartitioningManager(),
                 queryRunner.getAccessControl(),
                 sqlParser,
+                queryRunner.getStatsCalculator(),
+                costCalculator,
                 ImmutableMap.of());
     }
 

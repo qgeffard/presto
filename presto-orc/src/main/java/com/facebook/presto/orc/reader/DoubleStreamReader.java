@@ -86,7 +86,7 @@ public class DoubleStreamReader
             }
             if (readOffset > 0) {
                 if (dataStream == null) {
-                    throw new OrcCorruptionException("Value is not null but data stream is not present");
+                    throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but data stream is not present");
                 }
                 dataStream.skip(readOffset);
             }
@@ -95,7 +95,7 @@ public class DoubleStreamReader
         BlockBuilder builder = type.createBlockBuilder(new BlockBuilderStatus(), nextBatchSize);
         if (presentStream == null) {
             if (dataStream == null) {
-                throw new OrcCorruptionException("Value is not null but data stream is not present");
+                throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but data stream is not present");
             }
             dataStream.nextVector(type, nextBatchSize, builder);
         }
@@ -106,7 +106,7 @@ public class DoubleStreamReader
             int nullValues = presentStream.getUnsetBits(nextBatchSize, nullVector);
             if (nullValues != nextBatchSize) {
                 if (dataStream == null) {
-                    throw new OrcCorruptionException("Value is not null but data stream is not present");
+                    throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but data stream is not present");
                 }
                 dataStream.nextVector(type, nextBatchSize, builder, nullVector);
             }
@@ -134,7 +134,6 @@ public class DoubleStreamReader
 
     @Override
     public void startStripe(InputStreamSources dictionaryStreamSources, List<ColumnEncoding> encoding)
-            throws IOException
     {
         presentStreamSource = missingStreamSource(BooleanInputStream.class);
         dataStreamSource = missingStreamSource(DoubleInputStream.class);
@@ -150,7 +149,6 @@ public class DoubleStreamReader
 
     @Override
     public void startRowGroup(InputStreamSources dataStreamSources)
-            throws IOException
     {
         presentStreamSource = dataStreamSources.getInputStreamSource(streamDescriptor, PRESENT, BooleanInputStream.class);
         dataStreamSource = dataStreamSources.getInputStreamSource(streamDescriptor, DATA, DoubleInputStream.class);

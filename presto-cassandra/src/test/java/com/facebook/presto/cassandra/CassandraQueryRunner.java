@@ -32,7 +32,7 @@ public final class CassandraQueryRunner
     {
     }
 
-    private static boolean tpchLoaded = false;
+    private static boolean tpchLoaded;
 
     public static synchronized DistributedQueryRunner createCassandraQueryRunner()
             throws Exception
@@ -55,9 +55,8 @@ public final class CassandraQueryRunner
             List<TpchTable<?>> tables = TpchTable.getTables();
             copyTpchTables(queryRunner, "tpch", TINY_SCHEMA_NAME, createCassandraSession("tpch"), tables);
             for (TpchTable table : tables) {
-                EmbeddedCassandra.flush("tpch", table.getTableName());
+                EmbeddedCassandra.refreshSizeEstimates("tpch", table.getTableName());
             }
-            EmbeddedCassandra.refreshSizeEstimates();
             tpchLoaded = true;
         }
 

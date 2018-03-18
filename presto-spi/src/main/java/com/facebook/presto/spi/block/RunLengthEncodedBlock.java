@@ -18,9 +18,11 @@ import com.facebook.presto.spi.type.Type;
 import io.airlift.slice.Slice;
 import org.openjdk.jol.info.ClassLayout;
 
-import java.util.List;
+import java.util.function.BiConsumer;
 
-import static com.facebook.presto.spi.block.BlockUtil.checkValidPositions;
+import static com.facebook.presto.spi.block.BlockUtil.checkArrayRange;
+import static com.facebook.presto.spi.block.BlockUtil.checkValidPosition;
+import static com.facebook.presto.spi.block.BlockUtil.checkValidRegion;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
@@ -70,15 +72,22 @@ public class RunLengthEncodedBlock
     }
 
     @Override
-    public int getSizeInBytes()
+    public long getSizeInBytes()
     {
         return value.getSizeInBytes();
     }
 
     @Override
-    public int getRetainedSizeInBytes()
+    public long getRetainedSizeInBytes()
     {
         return INSTANCE_SIZE + value.getRetainedSizeInBytes();
+    }
+
+    @Override
+    public void retainedBytesForEachPart(BiConsumer<Object, Long> consumer)
+    {
+        consumer.accept(value, value.getRetainedSizeInBytes());
+        consumer.accept(this, (long) INSTANCE_SIZE);
     }
 
     @Override
@@ -88,21 +97,24 @@ public class RunLengthEncodedBlock
     }
 
     @Override
-    public Block copyPositions(List<Integer> positions)
+    public Block copyPositions(int[] positions, int offset, int length)
     {
-        checkValidPositions(positions, positionCount);
-        return new RunLengthEncodedBlock(value.copyRegion(0, 1), positions.size());
+        checkArrayRange(positions, offset, length);
+        for (int i = offset; i < offset + length; i++) {
+            checkValidPosition(positions[i], positionCount);
+        }
+        return new RunLengthEncodedBlock(value.copyRegion(0, 1), length);
     }
 
     @Override
     public Block getRegion(int positionOffset, int length)
     {
-        checkPositionIndexes(positionOffset, length);
+        checkValidRegion(positionCount, positionOffset, length);
         return new RunLengthEncodedBlock(value, length);
     }
 
     @Override
-    public int getRegionSizeInBytes(int position, int length)
+    public long getRegionSizeInBytes(int position, int length)
     {
         return value.getSizeInBytes();
     }
@@ -110,7 +122,7 @@ public class RunLengthEncodedBlock
     @Override
     public Block copyRegion(int positionOffset, int length)
     {
-        checkPositionIndexes(positionOffset, length);
+        checkValidRegion(positionCount, positionOffset, length);
         return new RunLengthEncodedBlock(value.copyRegion(0, 1), length);
     }
 
@@ -177,7 +189,7 @@ public class RunLengthEncodedBlock
     @Override
     public void writePositionTo(int position, BlockBuilder blockBuilder)
     {
-        value.writePositionTo(position, blockBuilder);
+        value.writePositionTo(0, blockBuilder);
     }
 
     @Override
@@ -226,13 +238,6 @@ public class RunLengthEncodedBlock
     public void assureLoaded()
     {
         value.assureLoaded();
-    }
-
-    private void checkPositionIndexes(int positionOffset, int length)
-    {
-        if (positionOffset < 0 || length < 0 || positionOffset + length > positionCount) {
-            throw new IndexOutOfBoundsException("Invalid position " + positionOffset + " in block with " + positionCount + " positions");
-        }
     }
 
     private void checkReadablePosition(int position)

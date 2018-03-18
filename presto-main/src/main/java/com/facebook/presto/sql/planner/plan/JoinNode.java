@@ -13,21 +13,28 @@
  */
 package com.facebook.presto.sql.planner.plan;
 
+import com.facebook.presto.sql.planner.SortExpressionContext;
 import com.facebook.presto.sql.planner.Symbol;
+import com.facebook.presto.sql.tree.ComparisonExpression;
+import com.facebook.presto.sql.tree.ComparisonExpressionType;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.Join;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import javax.annotation.concurrent.Immutable;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Stream;
 
+import static com.facebook.presto.sql.planner.SortExpressionExtractor.extractSortExpression;
 import static com.facebook.presto.sql.planner.plan.JoinNode.Type.INNER;
+import static com.facebook.presto.util.SpatialJoinUtils.isSpatialJoinFilter;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.util.Objects.requireNonNull;
@@ -51,6 +58,7 @@ public class JoinNode
     private final Optional<Symbol> leftHashSymbol;
     private final Optional<Symbol> rightHashSymbol;
     private final Optional<DistributionType> distributionType;
+    private final boolean spatialJoin;
 
     @JsonCreator
     public JoinNode(@JsonProperty("id") PlanNodeId id,
@@ -84,13 +92,17 @@ public class JoinNode
         this.leftHashSymbol = leftHashSymbol;
         this.rightHashSymbol = rightHashSymbol;
         this.distributionType = distributionType;
+        this.spatialJoin = type == INNER && criteria.isEmpty() && filter.isPresent() && isSpatialJoinFilter(left, right, filter.get());
 
         List<Symbol> inputSymbols = ImmutableList.<Symbol>builder()
                 .addAll(left.getOutputSymbols())
                 .addAll(right.getOutputSymbols())
                 .build();
-        checkArgument(inputSymbols.containsAll(outputSymbols), "Left and right join inputs do not contain all output symbols");
+        checkArgument(new HashSet<>(inputSymbols).containsAll(outputSymbols), "Left and right join inputs do not contain all output symbols");
         checkArgument(!isCrossJoin() || inputSymbols.equals(outputSymbols), "Cross join does not support output symbols pruning or reordering");
+
+        checkArgument(!(criteria.isEmpty() && leftHashSymbol.isPresent()), "Left hash symbol is only valid in an equijoin");
+        checkArgument(!(criteria.isEmpty() && rightHashSymbol.isPresent()), "Right hash symbol is only valid in an equijoin");
     }
 
     public enum DistributionType
@@ -168,6 +180,12 @@ public class JoinNode
         return filter;
     }
 
+    public Optional<SortExpressionContext> getSortExpressionContext()
+    {
+        return filter
+                .flatMap(filter -> extractSortExpression(ImmutableSet.copyOf(right.getOutputSymbols()), filter));
+    }
+
     @JsonProperty("leftHashSymbol")
     public Optional<Symbol> getLeftHashSymbol()
     {
@@ -200,7 +218,7 @@ public class JoinNode
     }
 
     @Override
-    public <C, R> R accept(PlanVisitor<C, R> visitor, C context)
+    public <R, C> R accept(PlanVisitor<R, C> visitor, C context)
     {
         return visitor.visitJoin(this, context);
     }
@@ -218,9 +236,19 @@ public class JoinNode
         return new JoinNode(getId(), type, newLeft, newRight, criteria, newOutputSymbols, filter, leftHashSymbol, rightHashSymbol, distributionType);
     }
 
+    public JoinNode withDistributionType(DistributionType distributionType)
+    {
+        return new JoinNode(getId(), type, left, right, criteria, outputSymbols, filter, leftHashSymbol, rightHashSymbol, Optional.of(distributionType));
+    }
+
     public boolean isCrossJoin()
     {
         return criteria.isEmpty() && !filter.isPresent() && type == INNER;
+    }
+
+    public boolean isSpatialJoin()
+    {
+        return spatialJoin;
     }
 
     public static class EquiJoinClause
@@ -245,6 +273,11 @@ public class JoinNode
         public Symbol getRight()
         {
             return right;
+        }
+
+        public ComparisonExpression toExpression()
+        {
+            return new ComparisonExpression(ComparisonExpressionType.EQUAL, left.toSymbolReference(), right.toSymbolReference());
         }
 
         @Override

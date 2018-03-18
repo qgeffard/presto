@@ -14,27 +14,43 @@
 package com.facebook.presto.sql.planner.iterative.rule.test;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.connector.ConnectorId;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.security.AccessControl;
+import com.facebook.presto.spi.Plugin;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.testing.LocalQueryRunner;
 import com.facebook.presto.tpch.TpchConnectorFactory;
+import com.facebook.presto.transaction.TransactionManager;
 import com.google.common.collect.ImmutableMap;
 
 import java.io.Closeable;
+import java.util.List;
 
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
+import static java.util.Collections.emptyList;
 
 public class RuleTester
         implements Closeable
 {
+    public static final String CATALOG_ID = "local";
+    public static final ConnectorId CONNECTOR_ID = new ConnectorId(CATALOG_ID);
+
     private final Metadata metadata;
     private final Session session;
     private final LocalQueryRunner queryRunner;
+    private final TransactionManager transactionManager;
+    private final AccessControl accessControl;
 
     public RuleTester()
     {
+        this(emptyList());
+    }
+
+    public RuleTester(List<Plugin> plugins)
+    {
         session = testSessionBuilder()
-                .setCatalog("local")
+                .setCatalog(CATALOG_ID)
                 .setSchema("tiny")
                 .setSystemProperty("task_concurrency", "1") // these tests don't handle exchanges from local parallel
                 .build();
@@ -42,19 +58,32 @@ public class RuleTester
         queryRunner = new LocalQueryRunner(session);
         queryRunner.createCatalog(session.getCatalog().get(),
                 new TpchConnectorFactory(1),
-                ImmutableMap.<String, String>of());
+                ImmutableMap.of());
+        plugins.stream().forEach(queryRunner::installPlugin);
 
         this.metadata = queryRunner.getMetadata();
+        this.transactionManager = queryRunner.getTransactionManager();
+        this.accessControl = queryRunner.getAccessControl();
     }
 
     public RuleAssert assertThat(Rule rule)
     {
-        return new RuleAssert(metadata, session, rule);
+        return new RuleAssert(metadata, queryRunner.getStatsCalculator(), queryRunner.getEstimatedExchangesCostCalculator(), session, rule, transactionManager, accessControl);
     }
 
     @Override
     public void close()
     {
         queryRunner.close();
+    }
+
+    public Metadata getMetadata()
+    {
+        return metadata;
+    }
+
+    public ConnectorId getCurrentConnectorId()
+    {
+        return queryRunner.inTransaction(transactionSession -> metadata.getCatalogHandle(transactionSession, session.getCatalog().get())).get();
     }
 }

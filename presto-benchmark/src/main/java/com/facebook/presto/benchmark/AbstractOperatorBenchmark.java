@@ -32,11 +32,11 @@ import com.facebook.presto.testing.LocalQueryRunner;
 import com.facebook.presto.transaction.TransactionId;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.stats.CpuTimer;
+import io.airlift.stats.TestingGcMonitor;
 import io.airlift.units.DataSize;
 
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutorService;
 
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
 import static io.airlift.stats.CpuTimer.CpuDuration;
@@ -96,26 +96,33 @@ public abstract class AbstractOperatorBenchmark
 
     protected OperatorFactory createHashProjectOperator(int operatorId, PlanNodeId planNodeId, List<Type> types)
     {
-        return localQueryRunner.createHashProjectOperator(operatorId, planNodeId, types);
+        return localQueryRunner.createHashProjectOperator(session, operatorId, planNodeId, types);
     }
 
     protected abstract List<Driver> createDrivers(TaskContext taskContext);
 
-    protected void execute(TaskContext taskContext)
+    protected Map<String, Long> execute(TaskContext taskContext)
     {
         List<Driver> drivers = createDrivers(taskContext);
 
+        long peakMemory = 0;
         boolean done = false;
         while (!done) {
             boolean processed = false;
             for (Driver driver : drivers) {
                 if (!driver.isFinished()) {
                     driver.process();
+                    long lastPeakMemory = peakMemory;
+                    peakMemory = (long) taskContext.getTaskStats().getUserMemoryReservation().getValue(BYTE);
+                    if (peakMemory <= lastPeakMemory) {
+                        peakMemory = lastPeakMemory;
+                    }
                     processed = true;
                 }
             }
             done = !processed;
         }
+        return ImmutableMap.of("peak_memory", peakMemory);
     }
 
     @Override
@@ -124,19 +131,27 @@ public abstract class AbstractOperatorBenchmark
         Session session = testSessionBuilder()
                 .setSystemProperty("optimizer.optimize-hash-generation", "true")
                 .build();
-        ExecutorService executor = localQueryRunner.getExecutor();
         MemoryPool memoryPool = new MemoryPool(new MemoryPoolId("test"), new DataSize(1, GIGABYTE));
         MemoryPool systemMemoryPool = new MemoryPool(new MemoryPoolId("testSystem"), new DataSize(1, GIGABYTE));
         SpillSpaceTracker spillSpaceTracker = new SpillSpaceTracker(new DataSize(1, GIGABYTE));
 
-        TaskContext taskContext = new QueryContext(new QueryId("test"), new DataSize(256, MEGABYTE), memoryPool, systemMemoryPool, executor, new DataSize(256, MEGABYTE), spillSpaceTracker)
-                .addTaskContext(new TaskStateMachine(new TaskId("query", 0, 0), executor),
+        TaskContext taskContext = new QueryContext(
+                new QueryId("test"),
+                new DataSize(256, MEGABYTE),
+                memoryPool,
+                systemMemoryPool,
+                new TestingGcMonitor(),
+                localQueryRunner.getExecutor(),
+                localQueryRunner.getScheduler(),
+                new DataSize(256, MEGABYTE),
+                spillSpaceTracker)
+                .addTaskContext(new TaskStateMachine(new TaskId("query", 0, 0), localQueryRunner.getExecutor()),
                         session,
                         false,
                         false);
 
         CpuTimer cpuTimer = new CpuTimer();
-        execute(taskContext);
+        Map<String, Long> executionStats = execute(taskContext);
         CpuDuration executionTime = cpuTimer.elapsedTime();
 
         TaskStats taskStats = taskContext.getTaskStats();
@@ -149,6 +164,7 @@ public abstract class AbstractOperatorBenchmark
 
         return ImmutableMap.<String, Long>builder()
                 // legacy computed values
+                .putAll(executionStats)
                 .put("elapsed_millis", executionTime.getWall().toMillis())
                 .put("input_rows_per_second", (long) (inputRows / executionTime.getWall().getValue(SECONDS)))
                 .put("output_rows_per_second", (long) (outputRows / executionTime.getWall().getValue(SECONDS)))

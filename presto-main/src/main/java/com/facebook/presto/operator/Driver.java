@@ -19,15 +19,14 @@ import com.facebook.presto.metadata.Split;
 import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.UpdatablePageSource;
-import com.facebook.presto.split.EmptySplit;
 import com.facebook.presto.sql.planner.plan.PlanNodeId;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
 import com.google.common.base.VerifyException;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.SettableFuture;
 import io.airlift.log.Logger;
 import io.airlift.units.Duration;
@@ -36,7 +35,9 @@ import javax.annotation.concurrent.GuardedBy;
 
 import java.io.Closeable;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -49,6 +50,8 @@ import static com.facebook.presto.operator.Operator.NOT_BLOCKED;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.util.concurrent.MoreExecutors.newDirectExecutorService;
+import static io.airlift.concurrent.MoreFutures.getFutureValue;
 import static java.lang.Boolean.TRUE;
 import static java.util.Objects.requireNonNull;
 
@@ -67,7 +70,13 @@ public class Driver
     private final List<Operator> operators;
     private final Optional<SourceOperator> sourceOperator;
     private final Optional<DeleteOperator> deleteOperator;
-    private final AtomicReference<TaskSource> newTaskSource = new AtomicReference<>();
+
+    // This variable acts as a staging area. When new splits (encapsulated in TaskSource) are
+    // provided to a Driver, the Driver will not process them right away. Instead, the splits are
+    // added to this staging area. This staging area will be drained asynchronously. That's when
+    // the new splits get processed.
+    private final AtomicReference<TaskSource> pendingTaskSourceUpdates = new AtomicReference<>();
+    private final Map<Operator, ListenableFuture<?>> revokingOperators = new HashMap<>();
 
     private final AtomicReference<State> state = new AtomicReference<>(State.ALIVE);
 
@@ -76,21 +85,36 @@ public class Driver
     @GuardedBy("exclusiveLock")
     private TaskSource currentTaskSource;
 
+    private final AtomicReference<SettableFuture<?>> driverBlockedFuture = new AtomicReference<>();
+
     private enum State
     {
         ALIVE, NEED_DESTRUCTION, DESTROYED
     }
 
-    public Driver(DriverContext driverContext, Operator firstOperator, Operator... otherOperators)
+    public static Driver createDriver(DriverContext driverContext, List<Operator> operators)
     {
-        this(requireNonNull(driverContext, "driverContext is null"),
-                ImmutableList.<Operator>builder()
-                        .add(requireNonNull(firstOperator, "firstOperator is null"))
-                        .add(requireNonNull(otherOperators, "otherOperators is null"))
-                        .build());
+        requireNonNull(driverContext, "driverContext is null");
+        requireNonNull(operators, "operators is null");
+        Driver driver = new Driver(driverContext, operators);
+        driver.initialize();
+        return driver;
     }
 
-    public Driver(DriverContext driverContext, List<Operator> operators)
+    @VisibleForTesting
+    public static Driver createDriver(DriverContext driverContext, Operator firstOperator, Operator... otherOperators)
+    {
+        requireNonNull(driverContext, "driverContext is null");
+        requireNonNull(firstOperator, "firstOperator is null");
+        requireNonNull(otherOperators, "otherOperators is null");
+        ImmutableList<Operator> operators = ImmutableList.<Operator>builder()
+                .add(firstOperator)
+                .add(otherOperators)
+                .build();
+        return createDriver(driverContext, operators);
+    }
+
+    private Driver(DriverContext driverContext, List<Operator> operators)
     {
         this.driverContext = requireNonNull(driverContext, "driverContext is null");
         this.operators = ImmutableList.copyOf(requireNonNull(operators, "operators is null"));
@@ -112,6 +136,20 @@ public class Driver
         this.deleteOperator = deleteOperator;
 
         currentTaskSource = sourceOperator.map(operator -> new TaskSource(operator.getSourceId(), ImmutableSet.of(), false)).orElse(null);
+        // initially the driverBlockedFuture is not blocked (it is completed)
+        SettableFuture<?> future = SettableFuture.create();
+        future.set(null);
+        driverBlockedFuture.set(future);
+    }
+
+    // the memory revocation request listeners are added here in a separate initialize() method
+    // instead of the constructor to prevent leaking the "this" reference to
+    // another thread, which will cause unsafe publication of this instance.
+    private void initialize()
+    {
+        operators.stream()
+                .map(Operator::getOperatorContext)
+                .forEach(operatorContext -> operatorContext.setMemoryRevocationRequestListener(() -> driverBlockedFuture.get().set(null)));
     }
 
     public DriverContext getDriverContext()
@@ -159,17 +197,15 @@ public class Driver
         return finished;
     }
 
-    public void updateSource(TaskSource source)
+    public void updateSource(TaskSource sourceUpdate)
     {
         checkLockNotHeld("Can not update sources while holding the driver lock");
-
-        // does this driver have an operator for the specified source?
-        if (!sourceOperator.isPresent() || !sourceOperator.get().getSourceId().equals(source.getPlanNodeId())) {
-            return;
-        }
+        checkArgument(
+                sourceOperator.isPresent() && sourceOperator.get().getSourceId().equals(sourceUpdate.getPlanNodeId()),
+                "sourceUpdate is for a plan node that is different from this Driver's source node");
 
         // stage the new updates
-        newTaskSource.updateAndGet(current -> current == null ? source : current.update(source));
+        pendingTaskSourceUpdates.updateAndGet(current -> current == null ? sourceUpdate : current.update(sourceUpdate));
 
         // attempt to get the lock and process the updates we staged above
         // updates will be processed in close if and only if we got the lock
@@ -186,15 +222,15 @@ public class Driver
             return;
         }
 
-        TaskSource source = newTaskSource.getAndSet(null);
-        if (source == null) {
+        TaskSource sourceUpdate = pendingTaskSourceUpdates.getAndSet(null);
+        if (sourceUpdate == null) {
             return;
         }
 
-        // merge the current source and the specified source
-        TaskSource newSource = currentTaskSource.update(source);
+        // merge the current source and the specified source update
+        TaskSource newSource = currentTaskSource.update(sourceUpdate);
 
-        // if source contains no new data, just return
+        // if the update contains no new data, just return
         if (newSource == currentTaskSource) {
             return;
         }
@@ -206,10 +242,6 @@ public class Driver
         SourceOperator sourceOperator = this.sourceOperator.orElseThrow(VerifyException::new);
         for (ScheduledSplit newSplit : newSplits) {
             Split split = newSplit.getSplit();
-
-            if (split.getConnectorSplit() instanceof EmptySplit) {
-                continue;
-            }
 
             Supplier<Optional<UpdatablePageSource>> pageSource = sourceOperator.addSplit(split);
             deleteOperator.ifPresent(deleteOperator -> deleteOperator.setPageSource(pageSource));
@@ -229,21 +261,29 @@ public class Driver
 
         requireNonNull(duration, "duration is null");
 
+        // if the driver is blocked we don't need to continue
+        SettableFuture<?> blockedFuture = driverBlockedFuture.get();
+        if (!blockedFuture.isDone()) {
+            return blockedFuture;
+        }
+
         long maxRuntime = duration.roundTo(TimeUnit.NANOSECONDS);
 
         Optional<ListenableFuture<?>> result = tryWithLock(100, TimeUnit.MILLISECONDS, () -> {
             driverContext.startProcessTimer();
+            driverContext.getYieldSignal().setWithDelay(maxRuntime, driverContext.getYieldExecutor());
             try {
                 long start = System.nanoTime();
                 do {
                     ListenableFuture<?> future = processInternal();
                     if (!future.isDone()) {
-                        return future;
+                        return updateDriverBlockedFuture(future);
                     }
                 }
                 while (System.nanoTime() - start < maxRuntime && !isFinishedInternal());
             }
             finally {
+                driverContext.getYieldSignal().reset();
                 driverContext.recordProcessed();
             }
             return NOT_BLOCKED;
@@ -255,14 +295,48 @@ public class Driver
     {
         checkLockNotHeld("Can not process while holding the driver lock");
 
-        Optional<ListenableFuture<?>> result = tryWithLock(100, TimeUnit.MILLISECONDS, this::processInternal);
+        // if the driver is blocked we don't need to continue
+        SettableFuture<?> blockedFuture = driverBlockedFuture.get();
+        if (!blockedFuture.isDone()) {
+            return blockedFuture;
+        }
+
+        Optional<ListenableFuture<?>> result = tryWithLock(100, TimeUnit.MILLISECONDS, () -> {
+            ListenableFuture<?> future = processInternal();
+            return updateDriverBlockedFuture(future);
+        });
         return result.orElse(NOT_BLOCKED);
+    }
+
+    private ListenableFuture<?> updateDriverBlockedFuture(ListenableFuture<?> sourceBlockedFuture)
+    {
+        // driverBlockedFuture will be completed as soon as the sourceBlockedFuture is completed
+        // or any of the operators gets a memory revocation request
+        SettableFuture<?> newDriverBlockedFuture = SettableFuture.create();
+        driverBlockedFuture.set(newDriverBlockedFuture);
+        sourceBlockedFuture.addListener(() -> newDriverBlockedFuture.set(null), newDirectExecutorService());
+
+        // it's possible that memory revoking is requested for some operator
+        // before we update driverBlockedFuture above and we don't want to miss that
+        // notification, so we check to see whether that's the case before returning.
+        boolean memoryRevokingRequested = operators.stream()
+                .filter(operator -> !revokingOperators.containsKey(operator))
+                .map(Operator::getOperatorContext)
+                .anyMatch(OperatorContext::isMemoryRevokingRequested);
+
+        if (memoryRevokingRequested) {
+            newDriverBlockedFuture.set(null);
+        }
+
+        return newDriverBlockedFuture;
     }
 
     @GuardedBy("exclusiveLock")
     private ListenableFuture<?> processInternal()
     {
         checkLockHeld("Lock must be held to call processInternal");
+
+        handleMemoryRevoke();
 
         try {
             processNewSources();
@@ -275,10 +349,10 @@ public class Driver
 
                 // check if operator is blocked
                 Operator current = operators.get(0);
-                ListenableFuture<?> blocked = isBlocked(current);
-                if (!blocked.isDone()) {
-                    current.getOperatorContext().recordBlocked(blocked);
-                    return blocked;
+                Optional<ListenableFuture<?>> blocked = getBlockedFuture(current);
+                if (blocked.isPresent()) {
+                    current.getOperatorContext().recordBlocked(blocked.get());
+                    return blocked.get();
                 }
 
                 // there is only one operator so just finish it
@@ -293,16 +367,13 @@ public class Driver
                 Operator current = operators.get(i);
                 Operator next = operators.get(i + 1);
 
-                // skip blocked operators
-                if (!isBlocked(current).isDone()) {
-                    continue;
-                }
-                if (!isBlocked(next).isDone()) {
+                // skip blocked operator
+                if (getBlockedFuture(current).isPresent()) {
                     continue;
                 }
 
-                // if the current operator is not finished and next operator needs input...
-                if (!current.isFinished() && next.needsInput()) {
+                // if the current operator is not finished and next operator isn't blocked and needs input...
+                if (!current.isFinished() && !getBlockedFuture(next).isPresent() && next.needsInput()) {
                     // get an output page from current operator
                     current.getOperatorContext().startIntervalTimer();
                     Page page = current.getOutput();
@@ -335,10 +406,10 @@ public class Driver
                 List<Operator> blockedOperators = new ArrayList<>();
                 List<ListenableFuture<?>> blockedFutures = new ArrayList<>();
                 for (Operator operator : operators) {
-                    ListenableFuture<?> blocked = isBlocked(operator);
-                    if (!blocked.isDone()) {
+                    Optional<ListenableFuture<?>> blocked = getBlockedFuture(operator);
+                    if (blocked.isPresent()) {
                         blockedOperators.add(operator);
-                        blockedFutures.add(blocked);
+                        blockedFutures.add(blocked.get());
                     }
                 }
 
@@ -377,6 +448,35 @@ public class Driver
     }
 
     @GuardedBy("exclusiveLock")
+    private void handleMemoryRevoke()
+    {
+        for (int i = 0; i < operators.size() && !driverContext.isDone(); i++) {
+            Operator operator = operators.get(i);
+
+            if (revokingOperators.containsKey(operator)) {
+                checkOperatorFinishedRevoking(operator);
+            }
+            else if (operator.getOperatorContext().isMemoryRevokingRequested()) {
+                ListenableFuture<?> future = operator.startMemoryRevoke();
+                revokingOperators.put(operator, future);
+                checkOperatorFinishedRevoking(operator);
+            }
+        }
+    }
+
+    @GuardedBy("exclusiveLock")
+    private void checkOperatorFinishedRevoking(Operator operator)
+    {
+        ListenableFuture<?> future = revokingOperators.get(operator);
+        if (future.isDone()) {
+            getFutureValue(future); // propagate exception if there was some
+            revokingOperators.remove(operator);
+            operator.finishMemoryRevoke();
+            operator.getOperatorContext().resetMemoryRevokingRequested();
+        }
+    }
+
+    @GuardedBy("exclusiveLock")
     private void destroyIfNecessary()
     {
         checkLockHeld("Lock must be held to call destroyIfNecessary");
@@ -408,36 +508,26 @@ public class Driver
                             driverContext.getTaskId());
                 }
                 try {
-                    operator.getOperatorContext().setMemoryReservation(0);
+                    operator.getOperatorContext().destroy();
                 }
                 catch (Throwable t) {
                     inFlightException = addSuppressedException(
                             inFlightException,
                             t,
-                            "Error freeing memory for operator %s for task %s",
-                            operator.getOperatorContext().getOperatorId(),
-                            driverContext.getTaskId());
-                }
-                try {
-                    operator.getOperatorContext().closeSystemMemoryContext();
-                }
-                catch (Throwable t) {
-                    inFlightException = addSuppressedException(
-                            inFlightException,
-                            t,
-                            "Error freeing system memory for operator %s for task %s",
+                            "Error freeing all allocated memory for operator %s for task %s",
                             operator.getOperatorContext().getOperatorId(),
                             driverContext.getTaskId());
                 }
             }
             if (driverContext.getMemoryUsage() > 0) {
-                log.error("Driver still has memory reserved after freeing all operator memory. Freeing it.");
+                log.error("Driver still has memory reserved after freeing all operator memory.");
             }
             if (driverContext.getSystemMemoryUsage() > 0) {
-                log.error("Driver still has system memory reserved after freeing all operator memory. Freeing it.");
+                log.error("Driver still has system memory reserved after freeing all operator memory.");
             }
-            driverContext.freeMemory(driverContext.getMemoryUsage());
-            driverContext.freeSystemMemory(driverContext.getSystemMemoryUsage());
+            if (driverContext.getRevocableMemoryUsage() > 0) {
+                log.error("Driver still has revocable memory reserved after freeing all operator memory. Freeing it.");
+            }
             driverContext.finished();
         }
         catch (Throwable t) {
@@ -462,13 +552,26 @@ public class Driver
         }
     }
 
-    private static ListenableFuture<?> isBlocked(Operator operator)
+    private Optional<ListenableFuture<?>> getBlockedFuture(Operator operator)
     {
-        ListenableFuture<?> blocked = operator.isBlocked();
-        if (blocked.isDone()) {
-            blocked = operator.getOperatorContext().isWaitingForMemory();
+        ListenableFuture<?> blocked = revokingOperators.get(operator);
+        if (blocked != null) {
+            // We mark operator as blocked regardless of blocked.isDone(), because finishMemoryRevoke has not been called yet.
+            return Optional.of(blocked);
         }
-        return blocked;
+        blocked = operator.isBlocked();
+        if (!blocked.isDone()) {
+            return Optional.of(blocked);
+        }
+        blocked = operator.getOperatorContext().isWaitingForMemory();
+        if (!blocked.isDone()) {
+            return Optional.of(blocked);
+        }
+        blocked = operator.getOperatorContext().isWaitingForRevocableMemory();
+        if (!blocked.isDone()) {
+            return Optional.of(blocked);
+        }
+        return Optional.empty();
     }
 
     private static Throwable addSuppressedException(Throwable inFlightException, Throwable newException, String message, Object... args)
@@ -505,7 +608,7 @@ public class Driver
     private static ListenableFuture<?> firstFinishedFuture(List<ListenableFuture<?>> futures)
     {
         SettableFuture<?> result = SettableFuture.create();
-        ExecutorService executor = MoreExecutors.newDirectExecutorService();
+        ExecutorService executor = newDirectExecutorService();
 
         for (ListenableFuture<?> future : futures) {
             future.addListener(() -> result.set(null), executor);
@@ -555,9 +658,10 @@ public class Driver
             }
         }
 
-        // if necessary, attempt to reacquire the lock and process new sources
+        // If there are more source updates available, attempt to reacquire the lock and process them.
+        // This can happen if new sources are added while we're holding the lock here doing work.
         // NOTE: this is separate duplicate code to make debugging lock reacquisition easier
-        while (newTaskSource.get() != null && state.get() == State.ALIVE && exclusiveLock.tryLock()) {
+        while (pendingTaskSourceUpdates.get() != null && state.get() == State.ALIVE && exclusiveLock.tryLock()) {
             try {
                 try {
                     processNewSources();

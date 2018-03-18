@@ -14,9 +14,6 @@
 package com.facebook.presto.sql.planner;
 
 import com.facebook.presto.spi.ColumnHandle;
-import com.facebook.presto.spi.predicate.Domain;
-import com.facebook.presto.spi.predicate.TupleDomain;
-import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.planner.plan.AggregationNode;
 import com.facebook.presto.sql.planner.plan.DistinctLimitNode;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
@@ -39,7 +36,6 @@ import com.facebook.presto.sql.tree.SymbolReference;
 import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 import java.util.ArrayList;
@@ -55,7 +51,7 @@ import java.util.function.Predicate;
 import static com.facebook.presto.sql.ExpressionUtils.combineConjuncts;
 import static com.facebook.presto.sql.ExpressionUtils.expressionOrNullSymbols;
 import static com.facebook.presto.sql.ExpressionUtils.extractConjuncts;
-import static com.facebook.presto.sql.ExpressionUtils.stripNonDeterministicConjuncts;
+import static com.facebook.presto.sql.ExpressionUtils.filterDeterministicConjuncts;
 import static com.facebook.presto.sql.planner.EqualityInference.createEqualityInference;
 import static com.facebook.presto.sql.tree.BooleanLiteral.TRUE_LITERAL;
 import static com.google.common.base.Predicates.in;
@@ -67,11 +63,11 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
  * Note: non-deterministic predicates can not be pulled up (so they will be ignored)
  */
 public class EffectivePredicateExtractor
-        extends PlanVisitor<Void, Expression>
+        extends PlanVisitor<Expression, Void>
 {
-    public static Expression extract(PlanNode node, Map<Symbol, Type> symbolTypes)
+    public static Expression extract(PlanNode node)
     {
-        return node.accept(new EffectivePredicateExtractor(symbolTypes), null);
+        return node.accept(new EffectivePredicateExtractor(), null);
     }
 
     private static final Predicate<Map.Entry<Symbol, ? extends Expression>> SYMBOL_MATCHES_EXPRESSION =
@@ -81,16 +77,10 @@ public class EffectivePredicateExtractor
             entry -> {
                 SymbolReference reference = entry.getKey().toSymbolReference();
                 Expression expression = entry.getValue();
+                // TODO: this is not correct with respect to NULLs ('reference IS NULL' would be correct, rather than 'reference = NULL')
                 // TODO: switch this to 'IS NOT DISTINCT FROM' syntax when EqualityInference properly supports it
                 return new ComparisonExpression(ComparisonExpressionType.EQUAL, reference, expression);
             };
-
-    private final Map<Symbol, Type> symbolTypes;
-
-    public EffectivePredicateExtractor(Map<Symbol, Type> symbolTypes)
-    {
-        this.symbolTypes = symbolTypes;
-    }
 
     @Override
     protected Expression visitPlan(PlanNode node, Void context)
@@ -123,7 +113,7 @@ public class EffectivePredicateExtractor
         Expression predicate = node.getPredicate();
 
         // Remove non-deterministic conjuncts
-        predicate = stripNonDeterministicConjuncts(predicate);
+        predicate = filterDeterministicConjuncts(predicate);
 
         return combineConjuncts(predicate, underlyingPredicate);
     }
@@ -184,19 +174,7 @@ public class EffectivePredicateExtractor
     public Expression visitTableScan(TableScanNode node, Void context)
     {
         Map<ColumnHandle, Symbol> assignments = ImmutableBiMap.copyOf(node.getAssignments()).inverse();
-        return DomainTranslator.toPredicate(spanTupleDomain(node.getCurrentConstraint()).transform(assignments::get));
-    }
-
-    private static TupleDomain<ColumnHandle> spanTupleDomain(TupleDomain<ColumnHandle> tupleDomain)
-    {
-        if (tupleDomain.isNone()) {
-            return tupleDomain;
-        }
-
-        // Simplify domains if they get too complex
-        Map<ColumnHandle, Domain> spannedDomains = Maps.transformValues(tupleDomain.getDomains().get(), DomainUtils::simplifyDomain);
-
-        return TupleDomain.withColumnDomains(spannedDomains);
+        return DomainTranslator.toPredicate(node.getCurrentConstraint().simplify().transform(assignments::get));
     }
 
     @Override
@@ -223,12 +201,9 @@ public class EffectivePredicateExtractor
         Expression leftPredicate = node.getLeft().accept(this, context);
         Expression rightPredicate = node.getRight().accept(this, context);
 
-        List<Expression> joinConjuncts = new ArrayList<>();
-        for (JoinNode.EquiJoinClause clause : node.getCriteria()) {
-            joinConjuncts.add(new ComparisonExpression(ComparisonExpressionType.EQUAL,
-                    clause.getLeft().toSymbolReference(),
-                    clause.getRight().toSymbolReference()));
-        }
+        List<Expression> joinConjuncts = node.getCriteria().stream()
+                .map(JoinNode.EquiJoinClause::toExpression)
+                .collect(toImmutableList());
 
         switch (node.getType()) {
             case INNER:
@@ -265,7 +240,7 @@ public class EffectivePredicateExtractor
         // Conjuncts without any symbol dependencies cannot be applied to the effective predicate (e.g. FALSE literal)
         return conjuncts.stream()
                 .map(expression -> pullExpressionThroughSymbols(expression, outputSymbols))
-                .map(expression -> DependencyExtractor.extractAll(expression).isEmpty() ? TRUE_LITERAL : expression)
+                .map(expression -> SymbolsExtractor.extractAll(expression).isEmpty() ? TRUE_LITERAL : expression)
                 .map(expressionOrNullSymbols(nullSymbolScopes))
                 .collect(toImmutableList());
     }

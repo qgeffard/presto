@@ -21,6 +21,8 @@ import com.facebook.presto.testing.QueryRunner;
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableMultiset;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Multiset;
+import com.google.common.collect.Multisets;
 import io.airlift.log.Logger;
 import io.airlift.tpch.TpchTable;
 import io.airlift.units.Duration;
@@ -28,10 +30,14 @@ import org.intellij.lang.annotations.Language;
 
 import java.util.List;
 import java.util.OptionalLong;
+import java.util.function.Supplier;
 
+import static com.google.common.base.Strings.nullToEmpty;
+import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
 import static io.airlift.units.Duration.nanosSince;
 import static java.lang.String.format;
 import static java.util.Locale.ENGLISH;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
@@ -77,7 +83,7 @@ public final class QueryAssertions
         long start = System.nanoTime();
         MaterializedResult actualResults = null;
         try {
-            actualResults = actualQueryRunner.execute(session, actual).toJdbcTypes();
+            actualResults = actualQueryRunner.execute(session, actual).toTestTypes();
         }
         catch (RuntimeException ex) {
             fail("Execution of 'actual' query failed: " + actual, ex);
@@ -90,7 +96,7 @@ public final class QueryAssertions
             expectedResults = h2QueryRunner.execute(session, expected, actualResults.getTypes());
         }
         catch (RuntimeException ex) {
-            fail("Execution of 'expected' query failed: " + actual, ex);
+            fail("Execution of 'expected' query failed: " + expected, ex);
         }
         log.info("FINISHED in presto: %s, h2: %s, total: %s", actualTime, nanosSince(expectedStart), nanosSince(start));
 
@@ -143,12 +149,39 @@ public final class QueryAssertions
         ImmutableMultiset<?> actualSet = ImmutableMultiset.copyOf(actual);
         ImmutableMultiset<?> expectedSet = ImmutableMultiset.copyOf(expected);
         if (!actualSet.equals(expectedSet)) {
-            fail(format("%snot equal\nActual %s rows:\n    %s\nExpected %s rows:\n    %s\n",
+            Multiset<?> unexpectedRows = Multisets.difference(actualSet, expectedSet);
+            Multiset<?> missingRows = Multisets.difference(expectedSet, actualSet);
+            int limit = 100;
+            fail(format(
+                    "%snot equal\n" +
+                            "Actual rows (up to %s of %s extra rows shown, %s matching and extra rows in total):\n    %s\n" +
+                            "Expected rows (up to %s of %s missing rows shown, %s matching and missing rows in total):\n    %s\n",
                     message == null ? "" : (message + "\n"),
+                    limit,
+                    unexpectedRows.size(),
                     actualSet.size(),
-                    Joiner.on("\n    ").join(Iterables.limit(actualSet, 100)),
+                    Joiner.on("\n    ").join(Iterables.limit(unexpectedRows, limit)),
+                    limit,
+                    missingRows.size(),
                     expectedSet.size(),
-                    Joiner.on("\n    ").join(Iterables.limit(expectedSet, 100))));
+                    Joiner.on("\n    ").join(Iterables.limit(missingRows, limit))));
+        }
+    }
+
+    public static void assertContainsEventually(Supplier<MaterializedResult> all, MaterializedResult expectedSubset, Duration timeout)
+    {
+        long start = System.nanoTime();
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                assertContains(all.get(), expectedSubset);
+                return;
+            }
+            catch (AssertionError e) {
+                if (nanosSince(start).compareTo(timeout) > 0) {
+                    throw e;
+                }
+            }
+            sleepUninterruptibly(50, MILLISECONDS);
         }
     }
 
@@ -163,6 +196,53 @@ public final class QueryAssertions
                         expectedSubset.getMaterializedRows().size(),
                         Joiner.on("\n    ").join(Iterables.limit(expectedSubset, 100))));
             }
+        }
+    }
+
+    protected static void assertQueryFailsEventually(QueryRunner queryRunner, Session session, @Language("SQL") String sql, @Language("RegExp") String expectedMessageRegExp, Duration timeout)
+    {
+        long start = System.nanoTime();
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                assertQueryFails(queryRunner, session, sql, expectedMessageRegExp);
+                return;
+            }
+            catch (AssertionError e) {
+                if (nanosSince(start).compareTo(timeout) > 0) {
+                    throw e;
+                }
+            }
+            sleepUninterruptibly(50, MILLISECONDS);
+        }
+    }
+
+    protected static void assertQueryFails(QueryRunner queryRunner, Session session, @Language("SQL") String sql, @Language("RegExp") String expectedMessageRegExp)
+    {
+        try {
+            queryRunner.execute(session, sql);
+            fail(format("Expected query to fail: %s", sql));
+        }
+        catch (RuntimeException ex) {
+            assertExceptionMessage(sql, ex, expectedMessageRegExp);
+        }
+    }
+
+    protected static void assertQueryReturnsEmptyResult(QueryRunner queryRunner, Session session, @Language("SQL") String sql)
+    {
+        try {
+            MaterializedResult results = queryRunner.execute(session, sql).toTestTypes();
+            assertNotNull(results);
+            assertEquals(results.getRowCount(), 0);
+        }
+        catch (RuntimeException ex) {
+            fail("Execution of query failed: " + sql, ex);
+        }
+    }
+
+    private static void assertExceptionMessage(String sql, Exception exception, @Language("RegExp") String regex)
+    {
+        if (!nullToEmpty(exception.getMessage()).matches(regex)) {
+            fail(format("Expected exception message '%s' to match '%s' for query: %s", exception.getMessage(), regex, sql), exception);
         }
     }
 

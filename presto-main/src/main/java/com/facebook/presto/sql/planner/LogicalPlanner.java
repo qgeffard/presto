@@ -26,6 +26,7 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.analyzer.Analysis;
 import com.facebook.presto.sql.analyzer.Field;
+import com.facebook.presto.sql.analyzer.RelationId;
 import com.facebook.presto.sql.analyzer.RelationType;
 import com.facebook.presto.sql.analyzer.Scope;
 import com.facebook.presto.sql.parser.SqlParser;
@@ -46,17 +47,19 @@ import com.facebook.presto.sql.tree.CreateTableAsSelect;
 import com.facebook.presto.sql.tree.Delete;
 import com.facebook.presto.sql.tree.Explain;
 import com.facebook.presto.sql.tree.Expression;
+import com.facebook.presto.sql.tree.Identifier;
 import com.facebook.presto.sql.tree.Insert;
 import com.facebook.presto.sql.tree.LambdaArgumentDeclaration;
 import com.facebook.presto.sql.tree.LongLiteral;
+import com.facebook.presto.sql.tree.NodeRef;
 import com.facebook.presto.sql.tree.NullLiteral;
 import com.facebook.presto.sql.tree.Query;
 import com.facebook.presto.sql.tree.Statement;
-import com.facebook.presto.util.maps.IdentityLinkedHashMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -116,6 +119,8 @@ public class LogicalPlanner
     {
         PlanNode root = planStatement(analysis, analysis.getStatement());
 
+        PlanSanityChecker.validateIntermediatePlan(root, session, metadata, sqlParser, symbolAllocator.getTypes());
+
         if (stage.ordinal() >= Stage.OPTIMIZED.ordinal()) {
             for (PlanOptimizer optimizer : planOptimizers) {
                 root = optimizer.optimize(root, session, symbolAllocator.getTypes(), symbolAllocator, idAllocator);
@@ -125,7 +130,7 @@ public class LogicalPlanner
 
         if (stage.ordinal() >= Stage.OPTIMIZED_AND_VALIDATED.ordinal()) {
             // make sure we produce a valid plan after optimizations run. This is mainly to catch programming errors
-            PlanSanityChecker.validate(root, session, metadata, sqlParser, symbolAllocator.getTypes());
+            PlanSanityChecker.validateFinalPlan(root, session, metadata, sqlParser, symbolAllocator.getTypes());
         }
 
         return new Plan(root, symbolAllocator.getTypes());
@@ -174,7 +179,7 @@ public class LogicalPlanner
         PlanNode root = underlyingPlan.getRoot();
         Scope scope = analysis.getScope(statement);
         Symbol outputSymbol = symbolAllocator.newSymbol(scope.getRelationType().getFieldByIndex(0));
-        root = new ExplainAnalyzeNode(idAllocator.getNextId(), root, outputSymbol);
+        root = new ExplainAnalyzeNode(idAllocator.getNextId(), root, outputSymbol, statement.isVerbose());
         return new RelationPlan(root, scope, ImmutableList.of(outputSymbol));
     }
 
@@ -184,7 +189,12 @@ public class LogicalPlanner
 
         RelationPlan plan = createRelationPlan(analysis, query);
 
-        ConnectorTableMetadata tableMetadata = createTableMetadata(destination, getOutputTableColumns(plan), analysis.getCreateTableProperties(), analysis.getParameters(), analysis.getCreateTableComment());
+        ConnectorTableMetadata tableMetadata = createTableMetadata(
+                destination,
+                getOutputTableColumns(plan, analysis.getColumnAliases()),
+                analysis.getCreateTableProperties(),
+                analysis.getParameters(),
+                analysis.getCreateTableComment());
         Optional<NewTableLayout> newTableLayout = metadata.getNewTableLayout(session, destination.getCatalogName(), tableMetadata);
 
         List<String> columnNames = tableMetadata.getColumns().stream()
@@ -245,7 +255,7 @@ public class LogicalPlanner
         List<Field> fields = visibleTableColumns.stream()
                 .map(column -> Field.newUnqualified(column.getName(), column.getType()))
                 .collect(toImmutableList());
-        Scope scope = Scope.builder().withRelationType(new RelationType(fields)).build();
+        Scope scope = Scope.builder().withRelationType(RelationId.anonymous(), new RelationType(fields)).build();
 
         plan = new RelationPlan(projectNode, scope, projectNode.getOutputSymbols());
 
@@ -373,27 +383,30 @@ public class LogicalPlanner
         return new ConnectorTableMetadata(table.asSchemaTableName(), columns, properties, comment);
     }
 
-    private static List<ColumnMetadata> getOutputTableColumns(RelationPlan plan)
+    private static List<ColumnMetadata> getOutputTableColumns(RelationPlan plan, Optional<List<Identifier>> columnAliases)
     {
         ImmutableList.Builder<ColumnMetadata> columns = ImmutableList.builder();
+        int aliasPosition = 0;
         for (Field field : plan.getDescriptor().getVisibleFields()) {
-            columns.add(new ColumnMetadata(field.getName().get(), field.getType()));
+            String columnName = columnAliases.isPresent() ? columnAliases.get().get(aliasPosition).getValue() : field.getName().get();
+            columns.add(new ColumnMetadata(columnName, field.getType()));
+            aliasPosition++;
         }
         return columns.build();
     }
 
-    private static IdentityLinkedHashMap<LambdaArgumentDeclaration, Symbol> buildLambdaDeclarationToSymbolMap(Analysis analysis, SymbolAllocator symbolAllocator)
+    private static Map<NodeRef<LambdaArgumentDeclaration>, Symbol> buildLambdaDeclarationToSymbolMap(Analysis analysis, SymbolAllocator symbolAllocator)
     {
-        IdentityLinkedHashMap<LambdaArgumentDeclaration, Symbol> resultMap = new IdentityLinkedHashMap<>();
-        for (Map.Entry<Expression, Type> entry : analysis.getTypes().entrySet()) {
-            if (!(entry.getKey() instanceof LambdaArgumentDeclaration)) {
+        Map<NodeRef<LambdaArgumentDeclaration>, Symbol> resultMap = new LinkedHashMap<>();
+        for (Map.Entry<NodeRef<Expression>, Type> entry : analysis.getTypes().entrySet()) {
+            if (!(entry.getKey().getNode() instanceof LambdaArgumentDeclaration)) {
                 continue;
             }
-            LambdaArgumentDeclaration lambdaArgumentDeclaration = (LambdaArgumentDeclaration) entry.getKey();
+            NodeRef<LambdaArgumentDeclaration> lambdaArgumentDeclaration = NodeRef.of((LambdaArgumentDeclaration) entry.getKey().getNode());
             if (resultMap.containsKey(lambdaArgumentDeclaration)) {
                 continue;
             }
-            resultMap.put(lambdaArgumentDeclaration, symbolAllocator.newSymbol(lambdaArgumentDeclaration, entry.getValue()));
+            resultMap.put(lambdaArgumentDeclaration, symbolAllocator.newSymbol(lambdaArgumentDeclaration.getNode(), entry.getValue()));
         }
         return resultMap;
     }

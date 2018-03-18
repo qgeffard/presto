@@ -128,8 +128,12 @@ public class TestSetFlatteningOptimizer
         List<PlanOptimizer> optimizers = ImmutableList.of(
                 new UnaliasSymbolReferences(),
                 new PruneUnreferencedOutputs(),
-                new IterativeOptimizer(new StatsRecorder(), ImmutableSet.of(new RemoveRedundantIdentityProjections())),
+                new IterativeOptimizer(
+                        new StatsRecorder(),
+                        getQueryRunner().getStatsCalculator(),
+                        getQueryRunner().getEstimatedExchangesCostCalculator(),
+                        ImmutableSet.of(new RemoveRedundantIdentityProjections())),
                 new SetFlatteningOptimizer());
-        assertPlanWithOptimizers(sql, pattern, optimizers);
+        assertPlan(sql, pattern, optimizers);
     }
 }

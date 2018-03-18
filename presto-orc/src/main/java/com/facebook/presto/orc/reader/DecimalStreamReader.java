@@ -97,10 +97,10 @@ public class DecimalStreamReader
         BlockBuilder builder = decimalType.createBlockBuilder(new BlockBuilderStatus(), nextBatchSize);
         if (presentStream == null) {
             if (decimalStream == null) {
-                throw new OrcCorruptionException("Value is not null but decimal stream is not present");
+                throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but decimal stream is not present");
             }
             if (scaleStream == null) {
-                throw new OrcCorruptionException("Value is not null but scale stream is not present");
+                throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but scale stream is not present");
             }
 
             Arrays.fill(nullVector, false);
@@ -117,10 +117,10 @@ public class DecimalStreamReader
             int nullValues = presentStream.getUnsetBits(nextBatchSize, nullVector);
             if (nullValues != nextBatchSize) {
                 if (decimalStream == null) {
-                    throw new OrcCorruptionException("Value is not null but decimal stream is not present");
+                    throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but decimal stream is not present");
                 }
                 if (scaleStream == null) {
-                    throw new OrcCorruptionException("Value is not null but scale stream is not present");
+                    throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but scale stream is not present");
                 }
 
                 scaleStream.nextLongVector(nextBatchSize, scaleVector, nullVector);
@@ -165,10 +165,10 @@ public class DecimalStreamReader
             }
             if (readOffset > 0) {
                 if (decimalStream == null) {
-                    throw new OrcCorruptionException("Value is not null but decimal stream is not present");
+                    throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but decimal stream is not present");
                 }
                 if (scaleStream == null) {
-                    throw new OrcCorruptionException("Value is not null but scale stream is not present");
+                    throw new OrcCorruptionException(streamDescriptor.getOrcDataSourceId(), "Value is not null but scale stream is not present");
                 }
 
                 decimalStream.skip(readOffset);
@@ -187,7 +187,6 @@ public class DecimalStreamReader
 
     @Override
     public void startStripe(InputStreamSources dictionaryStreamSources, List<ColumnEncoding> encoding)
-            throws IOException
     {
         presentStreamSource = missingStreamSource(BooleanInputStream.class);
         decimalStreamSource = missingStreamSource(DecimalInputStream.class);
@@ -205,7 +204,6 @@ public class DecimalStreamReader
 
     @Override
     public void startRowGroup(InputStreamSources dataStreamSources)
-            throws IOException
     {
         presentStreamSource = dataStreamSources.getInputStreamSource(streamDescriptor, PRESENT, BooleanInputStream.class);
         decimalStreamSource = dataStreamSources.getInputStreamSource(streamDescriptor, DATA, DecimalInputStream.class);

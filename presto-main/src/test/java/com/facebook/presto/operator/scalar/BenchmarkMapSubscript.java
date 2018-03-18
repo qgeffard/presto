@@ -16,20 +16,19 @@ package com.facebook.presto.operator.scalar;
 import com.facebook.presto.metadata.FunctionKind;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.metadata.Signature;
+import com.facebook.presto.operator.DriverYieldSignal;
 import com.facebook.presto.operator.project.PageProcessor;
 import com.facebook.presto.spi.Page;
-import com.facebook.presto.spi.block.ArrayBlock;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
 import com.facebook.presto.spi.block.BlockBuilderStatus;
 import com.facebook.presto.spi.block.DictionaryBlock;
-import com.facebook.presto.spi.block.InterleavedBlock;
-import com.facebook.presto.spi.block.SliceArrayBlock;
+import com.facebook.presto.spi.type.MapType;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.gen.ExpressionCompiler;
+import com.facebook.presto.sql.gen.PageFunctionCompiler;
 import com.facebook.presto.sql.relational.CallExpression;
 import com.facebook.presto.sql.relational.RowExpression;
-import com.facebook.presto.type.MapType;
 import com.google.common.collect.ImmutableList;
 import io.airlift.slice.Slice;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -56,12 +55,14 @@ import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
+import static com.facebook.presto.block.BlockAssertions.createSlicesBlock;
 import static com.facebook.presto.spi.function.OperatorType.SUBSCRIPT;
 import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
 import static com.facebook.presto.spi.type.VarcharType.createUnboundedVarcharType;
 import static com.facebook.presto.sql.relational.Expressions.constant;
 import static com.facebook.presto.sql.relational.Expressions.field;
 import static com.facebook.presto.testing.TestingConnectorSession.SESSION;
+import static com.facebook.presto.util.StructuralTestUtil.mapType;
 import static com.google.common.base.Verify.verify;
 import static io.airlift.slice.Slices.utf8Slice;
 
@@ -78,10 +79,9 @@ public class BenchmarkMapSubscript
 
     @Benchmark
     @OperationsPerInvocation(POSITIONS)
-    public List<Page> mapSubscript(BenchmarkData data)
-            throws Throwable
+    public List<Optional<Page>> mapSubscript(BenchmarkData data)
     {
-        return ImmutableList.copyOf(data.getPageProcessor().process(SESSION, data.getPage()));
+        return ImmutableList.copyOf(data.getPageProcessor().process(SESSION, new DriverYieldSignal(), data.getPage()));
     }
 
     @SuppressWarnings("FieldMayBeFinal")
@@ -101,7 +101,7 @@ public class BenchmarkMapSubscript
         public void setup()
         {
             MetadataManager metadata = MetadataManager.createTestMetadataManager();
-            ExpressionCompiler compiler = new ExpressionCompiler(metadata);
+            ExpressionCompiler compiler = new ExpressionCompiler(metadata, new PageFunctionCompiler(metadata, 0));
 
             List<String> keys;
             switch (mapSize) {
@@ -121,15 +121,15 @@ public class BenchmarkMapSubscript
             Block valueBlock;
             switch (name) {
                 case "fix-width":
-                    mapType = new MapType(createUnboundedVarcharType(), DOUBLE);
+                    mapType = mapType(createUnboundedVarcharType(), DOUBLE);
                     valueBlock = createFixWidthValueBlock(POSITIONS, mapSize);
                     break;
                 case "var-width":
-                    mapType = new MapType(createUnboundedVarcharType(), createUnboundedVarcharType());
+                    mapType = mapType(createUnboundedVarcharType(), createUnboundedVarcharType());
                     valueBlock = createVarWidthValueBlock(POSITIONS, mapSize);
                     break;
                 case "dictionary":
-                    mapType = new MapType(createUnboundedVarcharType(), createUnboundedVarcharType());
+                    mapType = mapType(createUnboundedVarcharType(), createUnboundedVarcharType());
                     valueBlock = createDictionaryValueBlock(POSITIONS, mapSize);
                     break;
                 default:
@@ -137,7 +137,7 @@ public class BenchmarkMapSubscript
             }
 
             Block keyBlock = createKeyBlock(POSITIONS, keys);
-            Block block = createMapBlock(POSITIONS, keyBlock, valueBlock);
+            Block block = createMapBlock(mapType, POSITIONS, keyBlock, valueBlock);
 
             ImmutableList.Builder<RowExpression> projectionsBuilder = ImmutableList.builder();
 
@@ -169,15 +169,14 @@ public class BenchmarkMapSubscript
             return page;
         }
 
-        private static Block createMapBlock(int positionCount, Block keyBlock, Block valueBlock)
+        private static Block createMapBlock(MapType mapType, int positionCount, Block keyBlock, Block valueBlock)
         {
-            InterleavedBlock interleavedBlock = new InterleavedBlock(new Block[] {keyBlock, valueBlock});
             int[] offsets = new int[positionCount + 1];
             int mapSize = keyBlock.getPositionCount() / positionCount;
             for (int i = 0; i < offsets.length; i++) {
-                offsets[i] = mapSize * 2 * i;
+                offsets[i] = mapSize * i;
             }
-            return new ArrayBlock(positionCount, new boolean[positionCount], offsets, interleavedBlock);
+            return mapType.createBlockFromKeyValue(new boolean[positionCount], offsets, keyBlock, valueBlock);
         }
 
         private static Block createKeyBlock(int positionCount, List<String> keys)
@@ -187,7 +186,7 @@ public class BenchmarkMapSubscript
             for (int i = 0; i < keyIds.length; i++) {
                 keyIds[i] = i % keys.size();
             }
-            return new DictionaryBlock(positionCount * keys.size(), keyDictionaryBlock, keyIds);
+            return new DictionaryBlock(keyDictionaryBlock, keyIds);
         }
 
         private static Block createFixWidthValueBlock(int positionCount, int mapSize)
@@ -226,7 +225,7 @@ public class BenchmarkMapSubscript
             for (int i = 0; i < keyIds.length; i++) {
                 keyIds[i] = ThreadLocalRandom.current().nextInt(0, dictionarySize);
             }
-            return new DictionaryBlock(positionCount * mapSize, dictionaryBlock, keyIds);
+            return new DictionaryBlock(dictionaryBlock, keyIds);
         }
 
         private static String randomString(int length)
@@ -246,7 +245,7 @@ public class BenchmarkMapSubscript
             for (int i = 0; i < keys.size(); i++) {
                 sliceArray[i] = utf8Slice(keys.get(i));
             }
-            return new SliceArrayBlock(sliceArray.length, sliceArray);
+            return createSlicesBlock(sliceArray);
         }
     }
 

@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.raptor.storage;
 
+import com.facebook.presto.memory.context.AggregatedMemoryContext;
 import com.facebook.presto.orc.FileOrcDataSource;
 import com.facebook.presto.orc.OrcDataSource;
 import com.facebook.presto.orc.OrcPredicate;
@@ -20,8 +21,6 @@ import com.facebook.presto.orc.OrcReader;
 import com.facebook.presto.orc.OrcRecordReader;
 import com.facebook.presto.orc.TupleDomainOrcPredicate;
 import com.facebook.presto.orc.TupleDomainOrcPredicate.ColumnReference;
-import com.facebook.presto.orc.memory.AggregatedMemoryContext;
-import com.facebook.presto.orc.metadata.OrcMetadataReader;
 import com.facebook.presto.orc.metadata.OrcType;
 import com.facebook.presto.raptor.RaptorColumnHandle;
 import com.facebook.presto.raptor.RaptorConnectorId;
@@ -46,13 +45,13 @@ import com.facebook.presto.spi.type.TypeManager;
 import com.facebook.presto.spi.type.TypeSignature;
 import com.facebook.presto.spi.type.TypeSignatureParameter;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.json.JsonCodec;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import io.airlift.slice.XxHash64;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 
@@ -61,8 +60,10 @@ import javax.inject.Inject;
 
 import java.io.Closeable;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -81,6 +82,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
+import static com.facebook.presto.orc.OrcEncoding.ORC;
 import static com.facebook.presto.raptor.RaptorColumnHandle.isBucketNumberColumn;
 import static com.facebook.presto.raptor.RaptorColumnHandle.isHiddenColumn;
 import static com.facebook.presto.raptor.RaptorColumnHandle.isShardRowIdColumn;
@@ -96,16 +99,19 @@ import static com.facebook.presto.raptor.storage.OrcPageSource.SHARD_UUID_COLUMN
 import static com.facebook.presto.raptor.storage.ShardStats.computeColumnStats;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
+import static com.facebook.presto.spi.type.CharType.createCharType;
 import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
 import static com.facebook.presto.spi.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.spi.type.VarcharType.createUnboundedVarcharType;
+import static com.facebook.presto.spi.type.VarcharType.createVarcharType;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
-import static com.google.common.base.Throwables.propagateIfInstanceOf;
+import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static io.airlift.concurrent.MoreFutures.allAsList;
 import static io.airlift.concurrent.MoreFutures.getFutureValue;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.airlift.json.JsonCodec.jsonCodec;
+import static io.airlift.units.DataSize.Unit.PETABYTE;
 import static java.lang.Math.min;
 import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
 import static java.util.Objects.requireNonNull;
@@ -122,6 +128,8 @@ public class OrcStorageManager
     private static final JsonCodec<ShardDelta> SHARD_DELTA_CODEC = jsonCodec(ShardDelta.class);
 
     private static final long MAX_ROWS = 1_000_000_000;
+    // TODO: do not limit the max size of blocks to read for now; enable the limit when the Hive connector is ready
+    private static final DataSize HUGE_MAX_READ_BLOCK_SIZE = new DataSize(1, PETABYTE);
     private static final JsonCodec<OrcFileMetadata> METADATA_CODEC = jsonCodec(OrcFileMetadata.class);
 
     private final String nodeId;
@@ -222,10 +230,10 @@ public class OrcStorageManager
     {
         OrcDataSource dataSource = openShard(shardUuid, readerAttributes);
 
-        AggregatedMemoryContext systemMemoryUsage = new AggregatedMemoryContext();
+        AggregatedMemoryContext systemMemoryUsage = newSimpleAggregatedMemoryContext();
 
         try {
-            OrcReader reader = new OrcReader(dataSource, new OrcMetadataReader(), readerAttributes.getMaxMergeDistance(), readerAttributes.getMaxReadSize());
+            OrcReader reader = new OrcReader(dataSource, ORC, readerAttributes.getMaxMergeDistance(), readerAttributes.getMaxReadSize(), HUGE_MAX_READ_BLOCK_SIZE);
 
             Map<Long, Integer> indexMap = columnIdIndex(reader.getColumnNames());
             ImmutableMap.Builder<Integer, Type> includedColumns = ImmutableMap.builder();
@@ -285,7 +293,7 @@ public class OrcStorageManager
     @Override
     public StoragePageSink createStoragePageSink(long transactionId, OptionalInt bucketNumber, List<Long> columnIds, List<Type> columnTypes, boolean checkSpace)
     {
-        if (storageService.getAvailableBytes() < minAvailableSpace.toBytes()) {
+        if (checkSpace && storageService.getAvailableBytes() < minAvailableSpace.toBytes()) {
             throw new PrestoException(RAPTOR_LOCAL_DISK_FULL, "Local disk is full on node " + nodeId);
         }
         return new OrcStoragePageSink(transactionId, columnIds, columnTypes, bucketNumber);
@@ -332,10 +340,12 @@ public class OrcStorageManager
             }
             catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                throw Throwables.propagate(e);
+                throw new RuntimeException(e);
             }
             catch (ExecutionException e) {
-                propagateIfInstanceOf(e.getCause(), PrestoException.class);
+                if (e.getCause() != null) {
+                    throwIfInstanceOf(e.getCause(), PrestoException.class);
+                }
                 throw new PrestoException(RAPTOR_RECOVERY_ERROR, "Error recovering shard " + shardUuid, e.getCause());
             }
             catch (TimeoutException e) {
@@ -354,18 +364,18 @@ public class OrcStorageManager
     private static FileOrcDataSource fileOrcDataSource(ReaderAttributes readerAttributes, File file)
             throws FileNotFoundException
     {
-        return new FileOrcDataSource(file, readerAttributes.getMaxMergeDistance(), readerAttributes.getMaxReadSize(), readerAttributes.getStreamBufferSize());
+        return new FileOrcDataSource(file, readerAttributes.getMaxMergeDistance(), readerAttributes.getMaxReadSize(), readerAttributes.getStreamBufferSize(), readerAttributes.isLazyReadSmallRanges());
     }
 
     private ShardInfo createShardInfo(UUID shardUuid, OptionalInt bucketNumber, File file, Set<String> nodes, long rowCount, long uncompressedSize)
     {
-        return new ShardInfo(shardUuid, bucketNumber, nodes, computeShardStats(file), rowCount, file.length(), uncompressedSize);
+        return new ShardInfo(shardUuid, bucketNumber, nodes, computeShardStats(file), rowCount, file.length(), uncompressedSize, xxhash64(file));
     }
 
     private List<ColumnStats> computeShardStats(File file)
     {
         try (OrcDataSource dataSource = fileOrcDataSource(defaultReaderAttributes, file)) {
-            OrcReader reader = new OrcReader(dataSource, new OrcMetadataReader(), defaultReaderAttributes.getMaxMergeDistance(), defaultReaderAttributes.getMaxReadSize());
+            OrcReader reader = new OrcReader(dataSource, ORC, defaultReaderAttributes.getMaxMergeDistance(), defaultReaderAttributes.getMaxReadSize(), HUGE_MAX_READ_BLOCK_SIZE);
 
             ImmutableList.Builder<ColumnStats> list = ImmutableList.builder();
             for (ColumnInfo info : getColumnInfo(reader)) {
@@ -453,6 +463,16 @@ public class OrcStorageManager
         return list.build();
     }
 
+    static long xxhash64(File file)
+    {
+        try (InputStream in = new FileInputStream(file)) {
+            return XxHash64.hash(in);
+        }
+        catch (IOException e) {
+            throw new PrestoException(RAPTOR_ERROR, "Failed to read file: " + file, e);
+        }
+    }
+
     private static Optional<OrcFileMetadata> getOrcFileMetadata(OrcReader reader)
     {
         return Optional.ofNullable(reader.getFooter().getUserMetadata().get(OrcFileMetadata.KEY))
@@ -480,6 +500,10 @@ public class OrcStorageManager
                 return DOUBLE;
             case STRING:
                 return createUnboundedVarcharType();
+            case VARCHAR:
+                return createVarcharType(type.getLength().get());
+            case CHAR:
+                return createCharType(type.getLength().get());
             case BINARY:
                 return VARBINARY;
             case DECIMAL:

@@ -20,15 +20,14 @@ import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.PageBuilder;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.block.Block;
+import com.facebook.presto.spi.type.MapType;
 import com.facebook.presto.spi.type.StandardTypes;
 import com.facebook.presto.sql.analyzer.FeaturesConfig;
-import com.facebook.presto.type.MapType;
 import com.facebook.presto.type.TypeRegistry;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
 import org.testng.annotations.Test;
 
-import java.io.IOException;
 import java.util.Map;
 import java.util.Optional;
 
@@ -39,6 +38,7 @@ import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
 import static com.facebook.presto.spi.type.RealType.REAL;
 import static com.facebook.presto.spi.type.TypeSignature.parseTypeSignature;
+import static com.facebook.presto.util.StructuralTestUtil.mapType;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 
@@ -65,7 +65,6 @@ public class TestRealHistogramAggregation
 
     @Test
     public void test()
-            throws Exception
     {
         Accumulator singleStep = factory.createAccumulator();
         singleStep.addInput(input);
@@ -84,7 +83,6 @@ public class TestRealHistogramAggregation
 
     @Test
     public void testMerge()
-            throws Exception
     {
         Accumulator singleStep = factory.createAccumulator();
         singleStep.addInput(input);
@@ -107,7 +105,6 @@ public class TestRealHistogramAggregation
 
     @Test
     public void testNull()
-            throws Exception
     {
         Accumulator accumulator = factory.createAccumulator();
         Block result = getFinalBlock(accumulator);
@@ -125,9 +122,8 @@ public class TestRealHistogramAggregation
     }
 
     private static Map<Float, Float> extractSingleValue(Block block)
-            throws IOException
     {
-        MapType mapType = new MapType(REAL, REAL);
+        MapType mapType = mapType(REAL, REAL);
         return (Map<Float, Float>) mapType.getObjectValue(null, block, 0);
     }
 

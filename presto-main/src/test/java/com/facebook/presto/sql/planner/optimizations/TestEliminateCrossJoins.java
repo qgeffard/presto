@@ -13,211 +13,105 @@
  */
 package com.facebook.presto.sql.planner.optimizations;
 
-import com.facebook.presto.sql.planner.PlanNodeIdAllocator;
-import com.facebook.presto.sql.planner.Symbol;
-import com.facebook.presto.sql.planner.optimizations.joins.JoinGraph;
-import com.facebook.presto.sql.planner.plan.Assignments;
-import com.facebook.presto.sql.planner.plan.JoinNode;
-import com.facebook.presto.sql.planner.plan.PlanNode;
-import com.facebook.presto.sql.planner.plan.ProjectNode;
-import com.facebook.presto.sql.planner.plan.ValuesNode;
-import com.facebook.presto.sql.tree.ArithmeticUnaryExpression;
-import com.facebook.presto.sql.tree.Expression;
-import com.facebook.presto.sql.tree.SymbolReference;
+import com.facebook.presto.SystemSessionProperties;
+import com.facebook.presto.sql.planner.assertions.BasePlanTest;
+import com.facebook.presto.sql.planner.assertions.PlanMatchPattern;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import org.testng.annotations.Test;
 
-import java.util.Arrays;
 import java.util.Optional;
 
-import static com.facebook.presto.sql.planner.optimizations.EliminateCrossJoins.isOriginalOrder;
-import static com.facebook.presto.sql.tree.ArithmeticUnaryExpression.Sign.MINUS;
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.collect.ImmutableList.toImmutableList;
-import static com.google.common.collect.Iterables.getOnlyElement;
-import static org.testng.Assert.assertEquals;
-import static org.testng.AssertJUnit.assertFalse;
-import static org.testng.AssertJUnit.assertTrue;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.anyTree;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.equiJoinClause;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.filter;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.join;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.tableScan;
+import static com.facebook.presto.sql.planner.plan.JoinNode.Type.INNER;
 
-@Test(singleThreaded = true)
 public class TestEliminateCrossJoins
+        extends BasePlanTest
 {
-    PlanNodeIdAllocator idAllocator = new PlanNodeIdAllocator();
+    private static final PlanMatchPattern ORDERS_TABLESCAN = tableScan("orders", ImmutableMap.of("O_ORDERKEY", "orderkey"));
+    private static final PlanMatchPattern ORDERS_WITH_SHIPPRIORITY_TABLESCAN = tableScan(
+            "orders",
+            ImmutableMap.of("O_ORDERKEY", "orderkey", "O_SHIPPRIORITY", "shippriority"));
+    private static final PlanMatchPattern SUPPLIER_TABLESCAN = tableScan("supplier", ImmutableMap.of("S_SUPPKEY", "suppkey"));
+    private static final PlanMatchPattern PART_TABLESCAN = tableScan("part", ImmutableMap.of("P_PARTKEY", "partkey"));
+    private static final PlanMatchPattern PART_WITH_NAME_TABLESCAN = tableScan("part", ImmutableMap.of("P_PARTKEY", "partkey", "P_NAME", "name"));
+    private static final PlanMatchPattern LINEITEM_TABLESCAN = tableScan(
+            "lineitem",
+            ImmutableMap.of(
+                    "L_PARTKEY", "partkey",
+                    "L_ORDERKEY", "orderkey"));
+    private static final PlanMatchPattern LINEITEM_WITH_RETURNFLAG_TABLESCAN = tableScan(
+            "lineitem",
+            ImmutableMap.of(
+                    "L_PARTKEY", "partkey",
+                    "L_ORDERKEY", "orderkey",
+                    "L_RETURNFLAG", "returnflag"));
+    private static final PlanMatchPattern LINEITEM_WITH_COMMENT_TABLESCAN = tableScan(
+            "lineitem",
+            ImmutableMap.of(
+                    "L_PARTKEY", "partkey",
+                    "L_ORDERKEY", "orderkey",
+                    "L_COMMENT", "comment"));
 
-    @Test
-    public void testIsOriginalOrder()
+    public TestEliminateCrossJoins()
     {
-        assertTrue(isOriginalOrder(ImmutableList.of(0, 1, 2, 3, 4)));
-        assertFalse(isOriginalOrder(ImmutableList.of(0, 2, 1, 3, 4)));
+        super(ImmutableMap.of(SystemSessionProperties.REORDER_JOINS, "true"));
     }
 
     @Test
-    public void testJoinOrder()
+    public void testEliminateSimpleCrossJoin()
     {
-        PlanNode plan =
-                join(
-                        join(
-                                values(symbol("a")),
-                                values(symbol("b"))),
-                        values(symbol("c")),
-                        symbol("a"), symbol("c"),
-                        symbol("c"), symbol("b"));
-
-        JoinGraph joinGraph = getOnlyElement(JoinGraph.buildFrom(plan));
-
-        assertEquals(
-                EliminateCrossJoins.getJoinOrder(joinGraph),
-                ImmutableList.of(0, 2, 1));
+        assertPlan("SELECT * FROM part p, orders o, lineitem l WHERE p.partkey = l.partkey AND l.orderkey = o.orderkey",
+                anyTree(
+                        join(INNER, ImmutableList.of(equiJoinClause("L_ORDERKEY", "O_ORDERKEY")),
+                                anyTree(
+                                        join(INNER, ImmutableList.of(equiJoinClause("P_PARTKEY", "L_PARTKEY")),
+                                                anyTree(PART_TABLESCAN),
+                                                anyTree(LINEITEM_TABLESCAN))),
+                                anyTree(ORDERS_TABLESCAN))));
     }
 
     @Test
-    public void testJoinOrderWithRealCrossJoin()
+    public void testGiveUpOnCrossJoin()
     {
-        PlanNode leftPlan =
-                join(
-                        join(
-                                values(symbol("a")),
-                                values(symbol("b"))),
-                        values(symbol("c")),
-                        symbol("a"), symbol("c"),
-                        symbol("c"), symbol("b"));
-
-        PlanNode rightPlan =
-                join(
-                        join(
-                                values(symbol("x")),
-                                values(symbol("y"))),
-                        values(symbol("z")),
-                        symbol("x"), symbol("z"),
-                        symbol("z"), symbol("y"));
-
-        PlanNode plan = join(leftPlan, rightPlan);
-
-        JoinGraph joinGraph = getOnlyElement(JoinGraph.buildFrom(plan));
-
-        assertEquals(
-                EliminateCrossJoins.getJoinOrder(joinGraph),
-                ImmutableList.of(0, 2, 1, 3, 5, 4));
+        assertPlan("SELECT o.orderkey FROM part p, orders o, lineitem l WHERE l.orderkey = o.orderkey",
+                anyTree(
+                        join(INNER, ImmutableList.of(equiJoinClause("O_ORDERKEY", "L_ORDERKEY")),
+                                anyTree(
+                                        join(INNER, ImmutableList.of(),
+                                                tableScan("part"),
+                                                anyTree(tableScan("orders", ImmutableMap.of("O_ORDERKEY", "orderkey"))))),
+                                anyTree(tableScan("lineitem", ImmutableMap.of("L_ORDERKEY", "orderkey"))))));
     }
 
     @Test
-    public void testJoinOrderWithMultipleEdgesBetweenNodes()
+    public void testEliminateCrossJoinWithNonEqualityCondition()
     {
-        PlanNode plan =
-                join(
-                        join(
-                                values(symbol("a")),
-                                values(symbol("b1"), symbol("b2"))),
-                        values(symbol("c1"), symbol("c2")),
-                        symbol("a"), symbol("c1"),
-                        symbol("c1"), symbol("b1"),
-                        symbol("c2"), symbol("b2"));
-
-        JoinGraph joinGraph = getOnlyElement(JoinGraph.buildFrom(plan));
-
-        assertEquals(
-                EliminateCrossJoins.getJoinOrder(joinGraph),
-                ImmutableList.of(0, 2, 1));
+        assertPlan("SELECT o.orderkey FROM part p, orders o, lineitem l " +
+                        "WHERE p.partkey = l.partkey AND l.orderkey = o.orderkey AND p.partkey <> o.orderkey AND p.name < l.comment",
+                anyTree(
+                        join(INNER, ImmutableList.of(equiJoinClause("L_ORDERKEY", "O_ORDERKEY")),
+                                anyTree(
+                                        join(INNER, ImmutableList.of(equiJoinClause("P_PARTKEY", "L_PARTKEY")), Optional.of("P_NAME < cast(L_COMMENT AS varchar(55))"),
+                                                anyTree(PART_WITH_NAME_TABLESCAN),
+                                                anyTree(filter("L_PARTKEY <> L_ORDERKEY", LINEITEM_WITH_COMMENT_TABLESCAN)))),
+                                anyTree(ORDERS_TABLESCAN))));
     }
 
     @Test
-    public void testDonNotChangeOrderWithoutCrossJoin()
+    public void testEliminateCrossJoinPreserveFilters()
     {
-        PlanNode plan =
-                join(
-                        join(
-                                values(symbol("a")),
-                                values(symbol("b")),
-                                symbol("a"), symbol("b")),
-                        values(symbol("c")),
-                        symbol("c"), symbol("b"));
-
-        JoinGraph joinGraph = getOnlyElement(JoinGraph.buildFrom(plan));
-
-        assertEquals(
-                EliminateCrossJoins.getJoinOrder(joinGraph),
-                ImmutableList.of(0, 1, 2));
-    }
-
-    @Test
-    public void testDoNotReorderCrossJoins()
-    {
-        PlanNode plan =
-                join(
-                        join(
-                                values(symbol("a")),
-                                values(symbol("b"))),
-                        values(symbol("c")),
-                        symbol("c"), symbol("b"));
-
-        JoinGraph joinGraph = getOnlyElement(JoinGraph.buildFrom(plan));
-
-        assertEquals(
-                EliminateCrossJoins.getJoinOrder(joinGraph),
-                ImmutableList.of(0, 1, 2));
-    }
-
-    @Test
-    public void testGiveUpOnNonIdentityProjections()
-    {
-        PlanNode plan =
-                join(
-                        project(
-                                join(
-                                        values(symbol("a1")),
-                                        values(symbol("b"))),
-                                symbol("a2"),
-                                new ArithmeticUnaryExpression(MINUS, new SymbolReference("a1"))),
-                        values(symbol("c")),
-                        symbol("a2"), symbol("c"),
-                        symbol("c"), symbol("b"));
-
-        assertEquals(JoinGraph.buildFrom(plan).size(), 2);
-    }
-
-    private PlanNode project(PlanNode source, String symbol, Expression expression)
-    {
-        return new ProjectNode(
-                idAllocator.getNextId(),
-                source,
-                Assignments.of(new Symbol(symbol), expression));
-    }
-
-    private String symbol(String name)
-    {
-        return name;
-    }
-
-    private JoinNode join(PlanNode left, PlanNode right, String... symbols)
-    {
-        checkArgument(symbols.length % 2 == 0);
-        ImmutableList.Builder<JoinNode.EquiJoinClause> criteria = ImmutableList.builder();
-
-        for (int i = 0; i < symbols.length; i += 2) {
-            criteria.add(new JoinNode.EquiJoinClause(new Symbol(symbols[i]), new Symbol(symbols[i + 1])));
-        }
-
-        return new JoinNode(
-                idAllocator.getNextId(),
-                JoinNode.Type.INNER,
-                left,
-                right,
-                criteria.build(),
-                ImmutableList.<Symbol>builder()
-                        .addAll(left.getOutputSymbols())
-                        .addAll(right.getOutputSymbols())
-                        .build(),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty(),
-                Optional.empty());
-    }
-
-    private ValuesNode values(String... symbols)
-    {
-        return new ValuesNode(
-                idAllocator.getNextId(),
-                Arrays.stream(symbols).map(Symbol::new).collect(toImmutableList()),
-                ImmutableList.of());
+        assertPlan("SELECT o.orderkey FROM part p, orders o, lineitem l " +
+                        "WHERE p.partkey = l.partkey AND l.orderkey = o.orderkey AND l.returnflag = 'R' AND shippriority >= 10",
+                anyTree(join(INNER, ImmutableList.of(equiJoinClause("L_ORDERKEY", "O_ORDERKEY")),
+                        anyTree(
+                                join(INNER, ImmutableList.of(equiJoinClause("P_PARTKEY", "L_PARTKEY")),
+                                        anyTree(PART_TABLESCAN),
+                                        anyTree(filter("L_RETURNFLAG = 'R'", LINEITEM_WITH_RETURNFLAG_TABLESCAN)))),
+                        anyTree(filter("O_SHIPPRIORITY >= 10", ORDERS_WITH_SHIPPRIORITY_TABLESCAN)))));
     }
 }

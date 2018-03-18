@@ -14,8 +14,11 @@
 package com.facebook.presto.sql.planner.assertions;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.cost.StatsProvider;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.sql.planner.Symbol;
+import com.facebook.presto.sql.planner.iterative.GroupReference;
+import com.facebook.presto.sql.planner.iterative.Lookup;
 import com.facebook.presto.sql.planner.plan.Assignments;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
 import com.facebook.presto.sql.planner.plan.PlanNode;
@@ -31,15 +34,19 @@ import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 final class PlanMatchingVisitor
-        extends PlanVisitor<PlanMatchPattern, MatchResult>
+        extends PlanVisitor<MatchResult, PlanMatchPattern>
 {
     private final Metadata metadata;
     private final Session session;
+    private final StatsProvider statsProvider;
+    private final Lookup lookup;
 
-    PlanMatchingVisitor(Session session, Metadata metadata)
+    PlanMatchingVisitor(Session session, Metadata metadata, StatsProvider statsProvider, Lookup lookup)
     {
         this.session = requireNonNull(session, "session is null");
         this.metadata = requireNonNull(metadata, "metadata is null");
+        this.statsProvider = requireNonNull(statsProvider, "statsProvider is null");
+        this.lookup = requireNonNull(lookup, "lookup is null");
     }
 
     @Override
@@ -79,6 +86,16 @@ final class PlanMatchingVisitor
     }
 
     @Override
+    public MatchResult visitGroupReference(GroupReference node, PlanMatchPattern pattern)
+    {
+        MatchResult match = lookup.resolve(node).accept(this, pattern);
+        if (match.isMatch()) {
+            return match;
+        }
+        return matchLeaf(node, pattern, pattern.shapeMatches(node));
+    }
+
+    @Override
     protected MatchResult visitPlan(PlanNode node, PlanMatchPattern pattern)
     {
         List<PlanMatchingState> states = pattern.shapeMatches(node);
@@ -104,7 +121,7 @@ final class PlanMatchingVisitor
 
             // Try upMatching this node with the the aliases gathered from the source nodes.
             SymbolAliases allSourceAliases = sourcesMatch.getAliases();
-            MatchResult matchResult = pattern.detailMatches(node, session, metadata, allSourceAliases);
+            MatchResult matchResult = pattern.detailMatches(node, statsProvider, session, metadata, allSourceAliases);
             if (matchResult.isMatch()) {
                 checkState(result == NO_MATCH, format("Ambiguous match on node %s", node));
                 result = match(allSourceAliases.withNewAliases(matchResult.getAliases()));
@@ -123,13 +140,13 @@ final class PlanMatchingVisitor
                 continue;
             }
 
-                /*
-                 * We have to call detailMatches for two reasons:
-                 * 1) Make sure there aren't any mismatches checking the internals of a leaf node.
-                 * 2) Collect the aliases from the source nodes so we can add them to
-                 *    SymbolAliases. They'll be needed further up.
-                 */
-            MatchResult matchResult = pattern.detailMatches(node, session, metadata, new SymbolAliases());
+            /*
+             * We have to call detailMatches for two reasons:
+             * 1) Make sure there aren't any mismatches checking the internals of a leaf node.
+             * 2) Collect the aliases from the source nodes so we can add them to
+             *    SymbolAliases. They'll be needed further up.
+             */
+            MatchResult matchResult = pattern.detailMatches(node, statsProvider, session, metadata, new SymbolAliases());
             if (matchResult.isMatch()) {
                 checkState(result == NO_MATCH, format("Ambiguous match on leaf node %s", node));
                 result = matchResult;

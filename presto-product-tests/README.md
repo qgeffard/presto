@@ -139,16 +139,22 @@ groups run the following command:
 presto-product-tests/bin/run_on_docker.sh <profile> -x quarantine,big_query,profile_specific_tests
 ```
 
-where [profile](#profile) is one of either:
+where profile is one of either:
+#### Profiles
 - **multinode** - pseudo-distributed Hadoop installation running on a
  single Docker container and a distributed Presto installation running on
  multiple Docker containers. For multinode the default configuration is
  1 coordinator and 1 worker.
-- **[singlenode](#singlenode)** - pseudo-distributed Hadoop installation running on a
+- **multinode-tls** - psuedo-distributed Hadoop installation running on a
+ single Docker container and a distributed Presto installation running on
+ multiple Docker containers. Presto is configured to only accept connections
+ on the HTTPS port (7878), and both coordinator and worker traffic is encrypted.
+ For multinode-tls, the default configuration is 1 coordinator and 2 workers.
+- **singlenode** - pseudo-distributed Hadoop installation running on a
  single Docker container and a single node installation of Presto also running
  on a single Docker container.
 - **singlenode-hdfs-impersonation** - HDFS impersonation enabled on top of the
- environment in [singlenode](#singlenode) profile. Presto impersonates the user
+ environment in singlenode profile. Presto impersonates the user
  who is running the query when accessing HDFS.
 - **singlenode-kerberos-hdfs-impersonation** - pseudo-distributed kerberized
  Hadoop installation running on a single Docker container and a single node
@@ -169,6 +175,20 @@ where [profile](#profile) is one of either:
  While running tests on ``singlenode-sqlserver`` make sure to exclude
  `mysql_connector` and `postgresql_connector` tests i.e.
  `-x mysql_connector, postgresql_connector`.
+
+### Hadoop docker image used for testing
+The default Hadoop/Hive docker image used for testing is defined in `conf/common/compose-commons.sh` and can be controlled
+via the `HADOOP_BASE_IMAGE` and `DOCKER_IMAGES_VERSION` env variables.
+- `HADOOP_BASE_IMAGE` defines the Hadoop distribution family (as found in [PrestoDB Hadoop docker
+repo](https://cloud.docker.com/swarm/prestodb/repository/list?name=hive&namespace=prestodb)). The name should be without
+the `-kerberized` suffix, eg. `cdh5.13-hive`. Only images that have their kerberized counterparts can be used with test profiles
+implying a kerberized environment eg. `singlenode-kerberos-hdfs-impersonation`, you should still use the base name for this
+env variable, the `-kerberized` suffix will be added automatically.
+- `DOCKER_IMAGES_VERSION` determines the version of the images used, both Hadoop images and base Centos images to host Presto,
+and serve as various run environments throughout the tests. Versions can be found on the
+[PrestoDB docker repo](https://cloud.docker.com/swarm/prestodb/repository/list) as well. You may use any version, either
+release or snapshot. Note that all images will be required to have this version, because this version is used globally.
+This is to ease maintenance and simplify debugging.
 
 Please keep in mind that if you run tests on Hive of version not greater than 1.0.1, you should exclude test from `post_hive_1_0_1` group by passing the following flag to tempto: `-x post_hive_1_0_1`.
 First version of Hive capable of running tests from `post_hive_1_0_1` group is Hive 1.1.0.
@@ -221,6 +241,7 @@ groups.
 | HDFS impersonation    | ``hdfs_impersonation``    | ``singlenode-hdfs-impersonation``, ``singlenode-kerberos-hdfs-impersonation``    |
 | No HDFS impersonation | ``hdfs_no_impersonation`` | ``singlenode``, ``singlenode-kerberos-hdfs-no_impersonation``                    |
 | LDAP                  | ``ldap``                  | ``singlenode-ldap``                                                              |
+| SQL Server            | ``sqlserver``             | ``singlenode-sqlserver``                                                         |
 
 Below is a list of commands that explain how to run these profile specific tests
 and also the entire test suite:
@@ -247,6 +268,12 @@ and also the entire test suite:
     ```
     presto-product-tests/bin/run_on_docker.sh singlenode-ldap -g ldap
     ```
+* Run **SQL Server** tests:
+
+    ```
+    presto-product-tests/bin/run_on_docker.sh singlenode-sqlserver -g sqlserver
+    ```
+
 * Run the **entire test suite** excluding all profile specific tests, where &lt;profile> can
 be any one of the available profiles:
 
@@ -255,7 +282,7 @@ be any one of the available profiles:
     ```
 
 Note: SQL Server product-tests use `microsoft/mssql-server-linux` docker container.
-By running SQL Server product tests you accept the license [ACCEPT_EULA](go.microsoft.com/fwlink/?LinkId=746388)
+By running SQL Server product tests you accept the license [ACCEPT_EULA](https://go.microsoft.com/fwlink/?LinkId=746388)
 
 ### Running from IntelliJ
 
@@ -271,7 +298,17 @@ environment variables:
 export PRESTO_SERVER_DIR=/tmp/presto-server-dir      #unpacked presto-server.tar.gz
 export PRESTO_CLI_JAR=/tmp/artifacts/presto-cli-executable.jar
 export PRODUCT_TESTS_JAR=/tmp/artifacts/presto-product-tests-executable.jar
+export PRESTO_JDBC_DRIVER_JAR=libs/PrestoJDBC42.jar
+export PRESTO_JDBC_DRIVER_CLASS=com.teradata.presto.jdbc42.Driver
 presto-product-tests/bin/run_on_docker.sh multinode -x quarantine,big_query,profile_specific_tests
+```
+
+To override tempto configuration put a new file into `presto-product-tests/conf/EXTRA_TEMPTO_CONFIG.yml` 
+and then set environment variable like below. Your configuration file will be loaded as last and so 
+it is able to override any configuration entry.
+
+```
+export TEMPTO_EXTRA_CONFIG_FILE=/docker/volumes/conf/EXTRA_TEMPTO_CONFIG.yml
 ```
 
 All of the variables are optional and fall back to local sources / build artifacts if unspecified.
@@ -321,19 +358,20 @@ The format of `/etc/hosts` entries is `<ip> <host>`:
         ```
         docker inspect $(presto-product-tests/conf/docker/singlenode/compose.sh ps -q hadoop-master) | grep -i IPAddress
         ```
+    Similarly add mappings for MySQL, Postgres and Cassandra containers (`mysql`, `postgres` and `cassandra` hostnames respectively).
+    To check IPs for those containers run:
 
-    Similarly add mappings for MySQL, Postgres and Cassandra containers (`mysql`, `postgres` and `cassandra` hostnames respectively). To check IPs for those containers run:
-
-        ```
-        docker inspect $(presto-product-tests/conf/docker/singlenode/compose.sh ps -q mysql) | grep -i IPAddress
-        docker inspect $(presto-product-tests/conf/docker/singlenode/compose.sh ps -q postgres) | grep -i IPAddress
-        docker inspect $(presto-product-tests/conf/docker/singlenode/compose.sh ps -q cassandra) | grep -i IPAddress
+    ```
+    docker inspect $(presto-product-tests/conf/docker/singlenode/compose.sh ps -q mysql) | grep -i IPAddress
+    docker inspect $(presto-product-tests/conf/docker/singlenode/compose.sh ps -q postgres) | grep -i IPAddress
+    docker inspect $(presto-product-tests/conf/docker/singlenode/compose.sh ps -q cassandra) | grep -i IPAddress
+    ```
 
     Alternatively you can use below script to obtain hosts ip mapping
 
-        ```
-        presto-product-tests/bin/hosts.sh singlenode
-        ```
+    ```
+    presto-product-tests/bin/hosts.sh singlenode
+    ```
 
     Note that above command requires [jq](https://stedolan.github.io/jq/) to be installed in your system
 
@@ -356,7 +394,7 @@ with the following parameters:
     - Use classpath of module: `presto-main`
     - Main class: `com.facebook.presto.server.PrestoServer`
     - Working directory: `presto-product-tests/conf/presto`
-    - VM options: `-ea -Xmx2G -Dconfig=etc/config.properties -Dlog.levels-file=etc/log.properties -DHADOOP_USER_NAME=hive -Duser.timezone=UTC`
+    - VM options: `-ea -Xmx2G -Dconfig=etc/config.properties -Dlog.levels-file=etc/log.properties -DHADOOP_USER_NAME=hive -Duser.timezone=Asia/Kathmandu`
 
 5. MAKE SURE PRESTO CONFIGURATION IS ALIGNED WITH THE ONE IN `presto-product-tests/conf/presto`!
 
@@ -400,7 +438,7 @@ section.
     note that execution of the product test will be suspended until a
     debugger is attached.
 
-3. Set a breakpoint at the beginning of the `com.teradata.tempto.internal.convention.ConventionBasedTestFactory#createTestCases`
+3. Set a breakpoint at the beginning of the `io.prestodb.tempto.internal.convention.ConventionBasedTestFactory#createTestCases`
 method. This is the main entry point for the convention based tests. When
 opening the `ConventionBasedTestFactory` class for the first time, IntelliJ
 will display a de-compiled version because `ConventionBasedTestFactory` is
@@ -424,7 +462,7 @@ running the debugger.
 
 Use the `docker-compose` (probably using a [wrapper](#use-the-docker-compose-wrappers))
 and `docker` utilities to control and troubleshoot containers.
-In the following examples ``<profile>`` is [profile](#profile).
+In the following examples ``<profile>`` is [profiles](#profiles).
 
 1. Use the following command to view output from running containers:
 

@@ -13,7 +13,6 @@
  */
 package com.facebook.presto.operator.aggregation;
 
-import com.facebook.presto.bytecode.DynamicClassLoader;
 import com.facebook.presto.metadata.BoundVariables;
 import com.facebook.presto.metadata.FunctionRegistry;
 import com.facebook.presto.metadata.SqlAggregationFunction;
@@ -23,14 +22,14 @@ import com.facebook.presto.operator.aggregation.state.ArrayAggregationStateFacto
 import com.facebook.presto.operator.aggregation.state.ArrayAggregationStateSerializer;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
-import com.facebook.presto.spi.block.BlockBuilderStatus;
 import com.facebook.presto.spi.function.AccumulatorState;
 import com.facebook.presto.spi.function.AccumulatorStateFactory;
 import com.facebook.presto.spi.function.AccumulatorStateSerializer;
+import com.facebook.presto.spi.type.ArrayType;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.TypeManager;
-import com.facebook.presto.type.ArrayType;
 import com.google.common.collect.ImmutableList;
+import io.airlift.bytecode.DynamicClassLoader;
 
 import java.lang.invoke.MethodHandle;
 import java.util.List;
@@ -107,7 +106,7 @@ public class ArrayAggregationFunction
                 outputType);
 
         GenericAccumulatorFactoryBinder factory = AccumulatorCompiler.generateAccumulatorFactoryBinder(metadata, classLoader);
-        return new InternalAggregationFunction(NAME, inputTypes, intermediateType, outputType, true, factory);
+        return new InternalAggregationFunction(NAME, inputTypes, intermediateType, outputType, true, true, factory);
     }
 
     private static List<ParameterMetadata> createInputParameterMetadata(Type value, boolean legacyArrayAgg)
@@ -119,7 +118,7 @@ public class ArrayAggregationFunction
     {
         BlockBuilder blockBuilder = state.getBlockBuilder();
         if (blockBuilder == null) {
-            blockBuilder = type.createBlockBuilder(new BlockBuilderStatus(), 4);
+            blockBuilder = type.createBlockBuilder(null, 4);
             state.setBlockBuilder(blockBuilder);
         }
         long startSize = blockBuilder.getRetainedSizeInBytes();

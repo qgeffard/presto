@@ -11,6 +11,14 @@ and return null for no input rows or when all values are null. For example,
 values in the count. The ``coalesce`` function can be used to convert null into
 zero.
 
+Some aggregate functions such as :func:`array_agg` produce different results
+depending on the order of input values. This ordering can be specified by writing
+an :ref:`order-by-clause` within the aggregate function::
+
+    array_agg(x ORDER BY y DESC)
+    array_agg(x ORDER BY x, y, z)
+
+
 General Aggregate Functions
 ---------------------------
 
@@ -25,6 +33,10 @@ General Aggregate Functions
 .. function:: avg(x) -> double
 
     Returns the average (arithmetic mean) of all input values.
+
+.. function:: avg(time interval type) -> time interval type
+
+    Returns the average interval length of all input values.
 
 .. function:: bool_and(boolean) -> boolean
 
@@ -153,7 +165,7 @@ Approximate Aggregate Functions
     is the standard deviation of the (approximately normal) error distribution
     over all possible sets. It does not guarantee an upper bound on the error
     for any specific input set. The current implementation of this function
-    requires that ``e`` be in the range: [0.01150, 0.26000].
+    requires that ``e`` be in the range of ``[0.0040625, 0.26000]``.
 
 .. function:: approx_percentile(x, percentage) -> [same as x]
 

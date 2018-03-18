@@ -15,6 +15,7 @@ package com.facebook.presto.tests;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.connector.ConnectorId;
+import com.facebook.presto.cost.StatsCalculator;
 import com.facebook.presto.metadata.AllNodes;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.QualifiedObjectName;
@@ -23,6 +24,7 @@ import com.facebook.presto.server.testing.TestingPrestoServer;
 import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.Plugin;
 import com.facebook.presto.sql.parser.SqlParserOptions;
+import com.facebook.presto.sql.planner.NodePartitioningManager;
 import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.testing.TestingAccessControlManager;
@@ -82,7 +84,7 @@ public final class StandaloneQueryRunner
     {
         lock.readLock().lock();
         try {
-            return prestoClient.execute(sql);
+            return prestoClient.execute(sql).getResult();
         }
         finally {
             lock.readLock().unlock();
@@ -94,7 +96,7 @@ public final class StandaloneQueryRunner
     {
         lock.readLock().lock();
         try {
-            return prestoClient.execute(session, sql);
+            return prestoClient.execute(session, sql).getResult();
         }
         finally {
             lock.readLock().unlock();
@@ -130,6 +132,18 @@ public final class StandaloneQueryRunner
     public Metadata getMetadata()
     {
         return server.getMetadata();
+    }
+
+    @Override
+    public NodePartitioningManager getNodePartitioningManager()
+    {
+        return server.getNodePartitioningManager();
+    }
+
+    @Override
+    public StatsCalculator getStatsCalculator()
+    {
+        return server.getStatsCalculator();
     }
 
     @Override
@@ -230,7 +244,6 @@ public final class StandaloneQueryRunner
         ImmutableMap.Builder<String, String> properties = ImmutableMap.<String, String>builder()
                 .put("query.client.timeout", "10m")
                 .put("exchange.http-client.idle-timeout", "1h")
-                .put("compiler.interpreter-enabled", "false")
                 .put("node-scheduler.min-candidates", "1")
                 .put("datasources", "system");
 

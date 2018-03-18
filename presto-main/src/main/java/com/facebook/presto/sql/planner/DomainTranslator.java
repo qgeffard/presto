@@ -28,6 +28,7 @@ import com.facebook.presto.spi.predicate.TupleDomain;
 import com.facebook.presto.spi.predicate.Utils;
 import com.facebook.presto.spi.predicate.ValueSet;
 import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.sql.ExpressionUtils;
 import com.facebook.presto.sql.FunctionInvoker;
 import com.facebook.presto.sql.analyzer.ExpressionAnalyzer;
 import com.facebook.presto.sql.parser.SqlParser;
@@ -43,10 +44,10 @@ import com.facebook.presto.sql.tree.InPredicate;
 import com.facebook.presto.sql.tree.IsNotNullPredicate;
 import com.facebook.presto.sql.tree.IsNullPredicate;
 import com.facebook.presto.sql.tree.LogicalBinaryExpression;
+import com.facebook.presto.sql.tree.NodeRef;
 import com.facebook.presto.sql.tree.NotExpression;
 import com.facebook.presto.sql.tree.NullLiteral;
 import com.facebook.presto.sql.tree.SymbolReference;
-import com.facebook.presto.util.maps.IdentityLinkedHashMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.PeekingIterator;
@@ -75,10 +76,13 @@ import static com.facebook.presto.sql.tree.ComparisonExpressionType.LESS_THAN_OR
 import static com.facebook.presto.sql.tree.ComparisonExpressionType.NOT_EQUAL;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.collect.Iterators.peekingIterator;
 import static java.util.Collections.emptyList;
+import static java.util.Comparator.comparing;
 import static java.util.Objects.requireNonNull;
+import static java.util.stream.Collectors.collectingAndThen;
 import static java.util.stream.Collectors.toList;
 
 public final class DomainTranslator
@@ -92,13 +96,12 @@ public final class DomainTranslator
         if (tupleDomain.isNone()) {
             return FALSE_LITERAL;
         }
-        ImmutableList.Builder<Expression> conjunctBuilder = ImmutableList.builder();
-        for (Map.Entry<Symbol, Domain> entry : tupleDomain.getDomains().get().entrySet()) {
-            Symbol symbol = entry.getKey();
-            SymbolReference reference = symbol.toSymbolReference();
-            conjunctBuilder.add(toPredicate(entry.getValue(), reference));
-        }
-        return combineConjuncts(conjunctBuilder.build());
+
+        Map<Symbol, Domain> domains = tupleDomain.getDomains().get();
+        return domains.entrySet().stream()
+                .sorted(comparing(entry -> entry.getKey().getName()))
+                .map(entry -> toPredicate(entry.getValue(), entry.getKey().toSymbolReference()))
+                .collect(collectingAndThen(toImmutableList(), ExpressionUtils::combineConjuncts));
     }
 
     private static Expression toPredicate(Domain domain, SymbolReference reference)
@@ -429,13 +432,11 @@ public final class DomainTranslator
                     return super.visitComparisonExpression(node, complement);
                 }
 
-                NullableValue value = normalized.getValue();
-                Type valueType = value.getType(); // type of value
                 Type castSourceType = typeOf(castExpression.getExpression(), session, metadata, types); // type of expression which is then cast to type of value
 
                 // we use saturated floor cast value -> castSourceType to rewrite original expression to new one with one cast peeled off the symbol side
                 Optional<Expression> coercedExpression = coerceComparisonWithRounding(
-                        castSourceType, castExpression.getExpression(), valueType, value.getValue(), normalized.getComparisonType());
+                        castSourceType, castExpression.getExpression(), normalized.getValue(), normalized.getComparisonType());
 
                 if (coercedExpression.isPresent()) {
                     return process(coercedExpression.get(), complement);
@@ -453,12 +454,12 @@ public final class DomainTranslator
          */
         private Optional<NormalizedSimpleComparison> toNormalizedSimpleComparison(ComparisonExpression comparison)
         {
-            IdentityLinkedHashMap<Expression, Type> expressionTypes = analyzeExpression(comparison);
+            Map<NodeRef<Expression>, Type> expressionTypes = analyzeExpression(comparison);
             Object left = ExpressionInterpreter.expressionOptimizer(comparison.getLeft(), metadata, session, expressionTypes).optimize(NoOpSymbolResolver.INSTANCE);
             Object right = ExpressionInterpreter.expressionOptimizer(comparison.getRight(), metadata, session, expressionTypes).optimize(NoOpSymbolResolver.INSTANCE);
 
-            Type leftType = expressionTypes.get(comparison.getLeft());
-            Type rightType = expressionTypes.get(comparison.getRight());
+            Type leftType = expressionTypes.get(NodeRef.of(comparison.getLeft()));
+            Type rightType = expressionTypes.get(NodeRef.of(comparison.getRight()));
 
             // TODO: re-enable this check once we fix the type coercions in the optimizers
             // checkArgument(leftType.equals(rightType), "left and right type do not match in comparison expression (%s)", comparison);
@@ -488,11 +489,13 @@ public final class DomainTranslator
 
         private boolean isImplicitCoercion(Cast cast)
         {
-            IdentityLinkedHashMap<Expression, Type> expressionTypes = analyzeExpression(cast);
-            return metadata.getTypeManager().canCoerce(expressionTypes.get(cast.getExpression()), expressionTypes.get(cast));
+            Map<NodeRef<Expression>, Type> expressionTypes = analyzeExpression(cast);
+            Type actualType = expressionTypes.get(NodeRef.of(cast.getExpression()));
+            Type expectedType = expressionTypes.get(NodeRef.<Expression>of(cast));
+            return metadata.getTypeManager().canCoerce(actualType, expectedType);
         }
 
-        private IdentityLinkedHashMap<Expression, Type> analyzeExpression(Expression expression)
+        private Map<NodeRef<Expression>, Type> analyzeExpression(Expression expression)
         {
             return ExpressionAnalyzer.getExpressionTypes(session, metadata, new SqlParser(), types, expression, emptyList() /* parameters already replaced */);
         }
@@ -579,11 +582,15 @@ public final class DomainTranslator
         private Optional<Expression> coerceComparisonWithRounding(
                 Type symbolExpressionType,
                 Expression symbolExpression,
-                Type valueType,
-                Object value,
+                NullableValue nullableValue,
                 ComparisonExpressionType comparisonType)
         {
-            requireNonNull(value, "value is null");
+            requireNonNull(nullableValue, "nullableValue is null");
+            if (nullableValue.isNull()) {
+                return Optional.empty();
+            }
+            Type valueType = nullableValue.getType();
+            Object value = nullableValue.getValue();
             return floorValue(valueType, symbolExpressionType, value)
                     .map((floorValue) -> rewriteComparisonExpression(symbolExpressionType, symbolExpression, valueType, value, floorValue, comparisonType));
         }
@@ -680,7 +687,7 @@ public final class DomainTranslator
         @Override
         protected ExtractionResult visitInPredicate(InPredicate node, Boolean complement)
         {
-            if (!(node.getValue() instanceof SymbolReference) || !(node.getValueList() instanceof InListExpression)) {
+            if (!(node.getValueList() instanceof InListExpression)) {
                 return super.visitInPredicate(node, complement);
             }
 
@@ -691,7 +698,17 @@ public final class DomainTranslator
             for (Expression expression : valueList.getValues()) {
                 disjuncts.add(new ComparisonExpression(EQUAL, node.getValue(), expression));
             }
-            return process(or(disjuncts.build()), complement);
+            ExtractionResult extractionResult = process(or(disjuncts.build()), complement);
+
+            // preserve original IN predicate as remaining predicate
+            if (extractionResult.tupleDomain.isAll()) {
+                Expression originalPredicate = node;
+                if (complement) {
+                    originalPredicate = new NotExpression(originalPredicate);
+                }
+                return new ExtractionResult(extractionResult.tupleDomain, originalPredicate);
+            }
+            return extractionResult;
         }
 
         @Override
@@ -750,8 +767,8 @@ public final class DomainTranslator
 
     private static Type typeOf(Expression expression, Session session, Metadata metadata, Map<Symbol, Type> types)
     {
-        IdentityLinkedHashMap<Expression, Type> expressionTypes = ExpressionAnalyzer.getExpressionTypes(session, metadata, new SqlParser(), types, expression, emptyList() /* parameters already replaced */);
-        return expressionTypes.get(expression);
+        Map<NodeRef<Expression>, Type> expressionTypes = ExpressionAnalyzer.getExpressionTypes(session, metadata, new SqlParser(), types, expression, emptyList() /* parameters already replaced */);
+        return expressionTypes.get(NodeRef.of(expression));
     }
 
     private static class NormalizedSimpleComparison
